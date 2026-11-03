@@ -18,8 +18,10 @@ from pathlib import Path
 
 __author__ = "Moxa Europe"
 __license__ = "GPLv3.0"
-__version__ = '4.1.5'
-__status__ = "Development"
+__version__ = '4.2.0'
+__status__ = "Production"
+
+UDMI_VERSION = "1.5.2"
 
 # Check whether the app is running from source or whether it is bundled ("frozen").
 #

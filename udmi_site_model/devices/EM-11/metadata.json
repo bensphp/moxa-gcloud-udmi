@@ -1,0 +1,205 @@
+{
+  "version": "1.5.2",
+  "timestamp": "2024-09-23T10:46:31Z",
+  "system": {
+    "location": {
+      "site": "UK-LON-GLAB",
+      "section": "GLAB",
+      "position": {
+        "x": 112.0,
+        "y": 102.3
+      }
+    },
+    "physical_tag": {
+      "asset": {
+        "guid": "guid://0757e4fc-dc8f-4cbe-9471-19336531f601",
+        "site": "UK-LON-GLAB",
+        "name": "EM-11"
+      }
+    },
+    "hardware": {
+      "make": "Schneider Electric",
+      "model": "PM5561"
+    },
+    "software": {
+      "firmware": "1.4.0"
+    },
+    "serial_no": "EM-11-SN-001"
+  },
+  "gateway": {
+    "gateway_id": "CGW-2",
+    "target": {
+      "family": "modbus"
+    }
+  },
+  "localnet": {
+    "families": {
+      "modbus": {
+        "addr": "ttyM0",
+        "unitid": "1"
+      }
+    }
+  },
+  "pointset": {
+    "points": {
+      "line1_neutral_voltage_sensor": {
+        "units": "Volts",
+        "ref": "3/3028/2?type=FLOAT32"
+      },
+      "line2_neutral_voltage_sensor": {
+        "units": "Volts",
+        "ref": "3/3030/2?type=FLOAT32"
+      },
+      "line3_neutral_voltage_sensor": {
+        "units": "Volts",
+        "ref": "3/3032/2?type=FLOAT32"
+      },
+      "average_line_neutral_voltage_sensor": {
+        "units": "Volts",
+        "ref": "3/3036/2?type=FLOAT32"
+      },
+      "line1_line2_voltage_sensor": {
+        "units": "Volts",
+        "ref": "3/3020/2?type=FLOAT32"
+      },
+      "line2_line3_voltage_sensor": {
+        "units": "Volts",
+        "ref": "3/3022/2?type=FLOAT32"
+      },
+      "line1_line3_voltage_sensor": {
+        "units": "Volts",
+        "ref": "3/3024/2?type=FLOAT32"
+      },
+      "average_line_line_voltage_sensor": {
+        "units": "Volts",
+        "ref": "3/3026/2?type=FLOAT32"
+      },
+      "line1_current_sensor": {
+        "units": "Amperes",
+        "ref": "3/3000/2?type=FLOAT32"
+      },
+      "line2_current_sensor": {
+        "units": "Amperes",
+        "ref": "3/3002/2?type=FLOAT32"
+      },
+      "line3_current_sensor": {
+        "units": "Amperes",
+        "ref": "3/3004/2?type=FLOAT32"
+      },
+      "average_line_current_sensor": {
+        "units": "Amperes",
+        "ref": "3/3010/2?type=FLOAT32"
+      },
+      "neutral_current_sensor": {
+        "units": "Amperes",
+        "ref": "3/3006/2?type=FLOAT32"
+      },
+      "line1_neutral_power_sensor": {
+        "units": "Kilowatts",
+        "ref": "3/3054/2?type=FLOAT32"
+      },
+      "line2_neutral_power_sensor": {
+        "units": "Kilowatts",
+        "ref": "3/3056/2?type=FLOAT32"
+      },
+      "line3_neutral_power_sensor": {
+        "units": "Kilowatts",
+        "ref": "3/3058/2?type=FLOAT32"
+      },
+      "total_power_sensor": {
+        "units": "Kilowatts",
+        "ref": "3/3060/2?type=FLOAT32"
+      },
+      "line1_neutral_apparent_power_sensor": {
+        "units": "Kilo-volt-amperes",
+        "ref": "3/3070/2?type=FLOAT32"
+      },
+      "line2_neutral_apparent_power_sensor": {
+        "units": "Kilo-volt-amperes",
+        "ref": "3/3072/2?type=FLOAT32"
+      },
+      "line3_neutral_apparent_power_sensor": {
+        "units": "Kilo-volt-amperes",
+        "ref": "3/3074/2?type=FLOAT32"
+      },
+      "total_apparent_power_sensor": {
+        "units": "Kilo-volt-amperes",
+        "ref": "3/3076/2?type=FLOAT32"
+      },
+      "line1_neutral_reactive_power_sensor": {
+        "units": "Kilo-volt-amperes-reactive",
+        "ref": "3/3062/2?type=FLOAT32"
+      },
+      "line2_neutral_reactive_power_sensor": {
+        "units": "Kilo-volt-amperes-reactive",
+        "ref": "3/3064/2?type=FLOAT32"
+      },
+      "line3_neutral_reactive_power_sensor": {
+        "units": "Kilo-volt-amperes-reactive",
+        "ref": "3/3066/2?type=FLOAT32"
+      },
+      "total_reactive_power_sensor": {
+        "units": "Kilo-volt-amperes-reactive",
+        "ref": "3/3068/2?type=FLOAT32"
+      },
+      "line1_neutral_powerfactor_sensor": {
+        "units": "No-units",
+        "ref": "3/3078/2?type=FLOAT32"
+      },
+      "line2_neutral_powerfactor_sensor": {
+        "units": "No-units",
+        "ref": "3/3080/2?type=FLOAT32"
+      },
+      "line3_neutral_powerfactor_sensor": {
+        "units": "No-units",
+        "ref": "3/3082/2?type=FLOAT32"
+      },
+      "total_powerfactor_sensor": {
+        "units": "No-units",
+        "ref": "3/3084/2?type=FLOAT32"
+      },
+      "total_energy_accumulator": {
+        "units": "Watt-hours",
+        "ref": "3/3216/4?type=INT64"
+      },
+      "total_reactive_energy_accumulator": {
+        "units": "Volt-amperes-reactive-hours",
+        "ref": "3/3232/4?type=INT64"
+      },
+      "frequency_sensor": {
+        "units": "Hertz",
+        "ref": "3/3110/2?type=FLOAT32"
+      }
+    }
+  },
+  "features": {
+    "system": {
+      "stage": "stable"
+    },
+    "pointset": {
+      "stage": "stable"
+    },
+    "gateway": {
+      "stage": "beta"
+    },
+    "enumeration": {
+      "stage": "beta"
+    },
+    "enumeration.families": {
+      "stage": "beta"
+    },
+    "enumeration.features": {
+      "stage": "beta"
+    },
+    "enumeration.pointset": {
+      "stage": "beta"
+    }
+  },
+  "testing": {
+    "targets": {
+      "tweaked_ref": {
+        "target_point": "line1_neutral_voltage_sensor"
+      }
+    }
+  }
+}

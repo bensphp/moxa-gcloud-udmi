@@ -1,0 +1,10 @@
+{
+  "version": "1.5.2",
+  "system": {
+    "min_loglevel": 300,
+    "metrics_rate_sec": 10
+  },
+  "pointset": {
+    "sample_rate_sec": 300
+  }
+}

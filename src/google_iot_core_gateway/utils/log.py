@@ -1,5 +1,9 @@
 import logging
-from colorlog import ColoredFormatter
+
+try:
+    from colorlog import ColoredFormatter
+except ImportError:  # pragma: no cover - optional dependency
+    ColoredFormatter = None
 
 """
 # Change log
@@ -19,33 +23,27 @@ def setup_logger():
     log_format = '%(asctime)s: %(levelname)s - %(module)s - %(message)s'
     formatter = logging.Formatter(log_format)
 
-    color_format = ColoredFormatter(
-        "%(asctime)s: %(log_color)s %(levelname) - 2s%(reset)s - %(module)s - %(message)s",
-        datefmt="[%Y-%m-%d %H:%M:%S]",
-        reset=False,
-        log_colors={
-            'DEBUG': 'cyan',
-            'INFO': 'green',
-            'WARNING': 'yellow',
-            'ERROR': 'red',
-            'CRITICAL': 'red', })
+    color_format = None
+    if ColoredFormatter is not None:
+        color_format = ColoredFormatter(
+            "%(asctime)s: %(log_color)s %(levelname) - 2s%(reset)s - %(module)s - %(message)s",
+            datefmt="[%Y-%m-%d %H:%M:%S]",
+            reset=False,
+            log_colors={
+                'DEBUG': 'cyan',
+                'INFO': 'green',
+                'WARNING': 'yellow',
+                'ERROR': 'red',
+                'CRITICAL': 'red', })
 
-    # Save full log
-    #logging.basicConfig(level=logging.DEBUG, datefmt="[%Y-%m-%d %H:%M:%S]", format=log_format, filename='main.log',
-    #                    filemode="w")
-    logging.basicConfig(level=logging.DEBUG, datefmt="[%Y-%m-%d %H:%M:%S]", format=log_format)              
+    logging.basicConfig(level=logging.INFO, datefmt="[%Y-%m-%d %H:%M:%S]", format=log_format)
 
     logger = logging.getLogger()
 
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.INFO)
-    console_handler.setFormatter(color_format)
-    #logger.addHandler(console_handler)
-
-    #error_handler = logging.FileHandler('error.log')
-    #error_handler.setLevel(logging.ERROR)
-    #error_handler.setFormatter(formatter)
-    #logger.addHandler(error_handler)
+    if color_format is not None:
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.INFO)
+        console_handler.setFormatter(color_format)
 
     return logger
 

@@ -6,144 +6,132 @@
 
 ## Table of Contents
 - [Overview](#overview)
-- [Features](#features)
+- [Key Capabilities (UDMI 1.5.2+)](#key-capabilities-udmi-152)
 - [Project Structure](#project-structure)
 - [Installation](#installation)
-- [Configuration](#configuration)
+- [Configuration & CGW-2 Site Model](#configuration--cgw-2-site-model)
 - [Usage](#usage)
+- [Local Testing & UDMI Sequencer Verification](#local-testing--udmi-sequencer-verification)
 - [Contributing](#contributing)
 - [License](#license)
 
 ## Overview
-The **Moxa GCloud UDMI Integration** project provides an interface between Moxa's edge computing devices for example UC-8200 with Google IoT Core/ClearBlade through the **UDMI (Unified Device Management Interface)** framework. This integration enables modbus telemetry reporting for industrial IoT applications according to UDMI specification.
+The **Moxa GCloud UDMI Integration** (`v4.2.0`) bridges Moxa industrial edge gateways (such as the **Moxa UC-8220** running `MXcloudgate`) with **ClearBlade IoT Core**, **Google Cloud IoT Core**, or **local UDMI MQTT reflectors** (`//mqtt/...`) using the **UDMI (Unified Device Management Interface) 1.5.2+** specification.
+
 ![image](https://github.com/user-attachments/assets/0a59dbb3-8941-408a-9212-7d70b7078d9e)
 
-## Features
-- **Cloud Integration:** Connect Moxa devices to Google Cloud IoT Core/ClearBlade via UDMI and MQTT.
-- **Telemetry Reporting:** Send real-time modbus telemetry data according to UDMI pointset and state payload from edge devices to the cloud
-- **Modbus to JSON Decoder:** Decode raw modbus rtu request and response as per Schneider meter definition files
+## Key Capabilities (UDMI 1.5.2+)
+- **First-Class Gateway & Proxied Device Lifecycle:** Publishes schema-valid UDMI `state`, `events/system`, `events/discovery`, and `events/pointset` for **both** the logical gateway (`CGW-2` / `CGW-1`) and all proxied Schneider Electric Modbus RTU energy meters (`EM-11`..`EM-13`, `PM5561`, `PM5111`, `PM8240`).
+- **System Mode & Self-Enumeration (`system.mode` & `enumeration.*`):**
+  - Supports UDMI `system.operation.mode` transitions (`"restart"` -> `"initial"` -> `"active"`), incrementing `restart_count` and advancing `last_start` (`system_mode_restart`).
+  - Supports UDMI `discovery` self-enumeration (`enumerate_nothing`, `enumerate_pointset`, `enumerate_features`, `enumerate_families`, `enumerate_multi`), synchronizing `state.discovery.generation` and publishing schema-valid `events/discovery` payloads.
+- **Full Downlink `config` Synchronization:** Subscribes to `/devices/{id}/config` (and `/r/{reg}/d/{id}/config` in local `mqtt` reflector mode) for the gateway and every attached proxy device:
+  - Echoes `config.timestamp` to `state.system.last_config` and maintains strict config-to-state **Subblock Parity** (`system`, `gateway`, `pointset`, `localnet`, `discovery`, `blobset`, `alarmset`).
+  - Handles malformed JSON configs (`broken_config`): logs `system.config.receive` (`100`) and `system.config.parse` (`500`), suppresses `system.config.apply`, sets `state.system.status` (`category: "system.config.parse"`, `level: 500`), and preserves the last valid `last_config`.
+  - Honors `system.min_loglevel` across `receive` (`100`), `parse` (`100`/`500`), and `apply` (`300`), and emits periodic `events/system` host `metrics` (`mem_total_mb`, `mem_free_mb`, `store_total_mb`, `store_free_mb`, `load_average`) when `metrics_rate_sec > 0`.
+  - Ignores unknown out-of-schema config fields (`extra_config`) without failing.
+- **Dirty-Only Throttled State Updates:** Publishes `state` only when state content changes (after an initial config holdoff and `>2s` minimum spacing), passing `too_much_state` and strict intermediate state validation.
+- **Dynamic Pointset & Sampling Control:**
+  - Supports per-device `sample_rate_sec` and `sample_limit_sec` (e.g. `pointset_publish_interval` narrow windows), empty gateway pointsets (`points: {}`), dynamic point removal (`pointset_remove_point`), unknown point error reporting (`pointset.point.invalid` at `500`), and invalid `ref` error reporting (`pointset.point.failure` at `500`).
+  - Supports both UDMI 1.5 canonical `ModbusFamilyProvider` point references (`[modbus://<addr>/][<unitid>/]<fc>/<reg>[/<qty>][?type=...]`, e.g. `3/3028/2?type=FLOAT32`) and legacy register addresses (`3028`).
+  - Filters `NaN`/`Inf`/unread Modbus values out of `events/pointset` so numerical points are strictly JSON numbers (`pointset_numeric_values`).
+- **Gateway & Localnet Discovery:**
+  - Discovers real Linux host NIC addresses (`ether`, `ipv4`, `ipv6`) on the gateway (`family_ether_addr`, `family_ipv4_addr`, `family_ipv6_addr`) with multi-NIC (`eth0`/`eth1`) matching, while isolating proxied devices' `state.localnet.families` to their own fieldbus family (`modbus`).
+  - Validates proxied `config.gateway.target` (`bad_target_family`, `bad_target_address` -> `gateway.proxy.target` at `500`) and dynamically syncs `config.gateway.proxy_ids` (`attach`/`detach`).
+- **Hardened Modbus RTU Decoder & MQTT Transport:**
+  - Validates Modbus RTU CRC-16 (`0xA001`), detects Modbus exception responses (`fc | 0x80`), supports odd & multi-register numeric/ASCII formats (`float32`, `float64`, `int64`, `int32u`, `int16u`, `str40`), and supports Python **3.9–3.13+** with both `paho-mqtt` **1.x and 2.x** (`RS256` and `ES256` JWTs).
 
 ## Project Structure
 ```plaintext
 moxa-gcloud-udmi/
-│
-├── docs/                                 # Documentation files
-│   └──                                   # Any project relevent document files goes here
-├── src/                                  # Source code for the project
-|   └── main.py                           # Main entry file 
-│   ├── google_iot_core_gateway/          # Google IoT Core/ClearBlade module
-│       └── internal_broker_subscriber/   # Code for subscribing raw rtu request and response from internal mosquitto broker
-│       └── modbus_gw/                    # Code for decoding raw rtu request/response as per Schneider meter definition file
-│       └── udmi_handler/                 # Code for udmi mapping for modbus to dbo names and constructing payload pointset and state
-│       └── utils/                        # Code for Google IoT Core authentication and Configuration handlers
-│       └── gcp_manager.py                # Code for create registry, devices and gateway on the Google Iot Core.
-│       └── gcp_publisher.py              # Code for connecting and publishing telemetry to the Google Iot Core using paho mqtt library
-│       └── gcp_handler.py                # Code for starting the google IoT Core function and other initialization task. This file is called in main.py 
-├── resources/                            # Resource dir for configuration
-│   └── config-google-gateway.json        # Example configuration file google clear blade IoT core
-|   └── modbus_dbo_maps                   # Example schneider meter definition files e.g PM5111
-├── udmi_site_model/                      # Resource dir for UDMI site models 
-│   └── cloud_iot_config.json             # Example UDMI project configuration file
-|   └── devices                           # Example meta data files Gateway CGW-1 and Devices EM-1, EM-2 
-├── LICENSE                               # Project license
-├── README.md                             # Project readme (this file)
-└── CONTRIBUTING.md                       # Guidelines for contributing to the project
+├── resources/
+│   ├── certs/roots.pem                   # Google / ClearBlade TLS Root CAs
+│   ├── config-google-gateway.json        # Gateway runtime configuration (CGW-2 default)
+│   ├── config-cgw2-example.json          # Annotated CGW-2 + EM-11..13 configuration example
+│   └── modbus_dbo_maps/                  # Schneider Electric register maps (PM5561, PM5111, PM8240)
+├── src/
+│   ├── main.py                           # Gateway CLI entry point
+│   ├── app_data.py                       # Runtime thread state holder
+│   └── google_iot_core_gateway/
+│       ├── gcp_handler.py                # Main event loop (Modbus queue, downlink configs, UDMI publish)
+│       ├── gcp_publisher.py              # Cloud IoT / ClearBlade (`/devices/...`) & local UDMI (`/r/...`) MQTT client
+│       ├── gcp_manager.py                # Cloud IoT registry/device provisioning helper
+│       ├── internal_broker_subscriber/   # Internal Mosquitto subscriber (`MXcloudgate` RTU frames)
+│       ├── modbus_gw/                    # CRC-16 validated Modbus RTU -> JSON register decoder
+│       ├── udmi_handler/                 # UDMI 1.5.2+ state, config, system event & pointset engine
+│       └── utils/                        # Config, certificate (RSA/EC), JWT & logging utilities
+├── tests/
+│   └── test_udmi_sequencer_compliance.py # Unit & live-Mosquitto end-to-end compliance tests
+├── tools/
+│   └── mxcloudgate_simulator.py          # Synthetic MXcloudgate Modbus RTU publisher (slaves 1, 2, 3)
+└── udmi_site_model/                      # Clean UDMI 1.5.2 site model templates (CGW-2/EM-11..13 & CGW-1/EM-1..3)
 ```
 
 ## Installation
-To set up the project locally, follow these steps:
-### Preconditions
-1. Python version 3.9 - abel to run with `python3.9` command
-2. Git
-3. pyinstaller
-4. pip
+Compatible with **Python 3.9–3.13+** (including Debian 11 `python3.9` on Moxa UC-8220).
 
-### Clone the repository:
 ```bash
-sudo git clone https://github.com/MEUIIOT/moxa-gcloud-udmi.git
+git clone https://github.com/MEUIIOT/moxa-gcloud-udmi.git
 cd moxa-gcloud-udmi
-```
-### Install required `pip` packages
-```bash
-sudo pip3.9 install -r src/google_iot_core_gateway/requirements.txt
+python3 -m pip install -r requirements.txt
 ```
 
-## Configuration
-Modify the configuration files
+## Configuration & CGW-2 Site Model
+1. **Gateway Configuration (`resources/config-google-gateway.json`):**
+   Configure `internal_broker` (host/port of the local `MXcloudgate` broker), `google_cloud` (`iot_provider`: `"gbos"` for ClearBlade/GCP IoT Core or `"mqtt"` for a local UDMI reflector broker, `project_id`, `cloud_region`, `mqtt_bridge_hostname`), `site_details` (`gateway_id: "CGW-2"`, `serial_no`, and `proxy_ids` mapping `EM-11` -> slave `1` `PM5561`, `EM-12` -> slave `2` `PM5111`, `EM-13` -> slave `3` `PM8240`), and `environment_setup.udmi_site_model_path`.
+2. **UDMI 1.5.2 Site Model (`udmi_site_model/`):**
+   - Ready-to-use `Registrar`-validated templates are provided under `udmi_site_model/devices/CGW-2` and `udmi_site_model/devices/EM-11..13` (as well as `CGW-1` and `EM-1..3`).
+   - **Important for UDMI Sequencer runs on `CGW-2`:** If your site model previously had `"testing": {"nostate": true}` on `CGW-2` or `EM-11..13` from older v4.1.x deployments, remove `"nostate": true` so the UDMI Sequencer enables all `state`-dependent sequences (`system_last_update`, `broken_config`, `extra_config`, `state_make_model`, `state_software`, `too_much_state`, `family_*_addr`, `gateway_proxy_state`, `pointset_remove_point`, `pointset_request_extraneous`, `bad_target_*`, `bad_point_ref`).
+   - Place the gateway private key (`rsa_private.pem` / `rsa_private.pkcs8` or `ec_private.pem`) in `udmi_site_model/devices/CGW-2/` and register the corresponding public key in ClearBlade / UDMIS.
 
-1. Edit the `resources/config-google-gateway.json` file
-2. Edit the `resources/modbus_dbo_maps/*.json` file that converts the Modbus registry to DBO names
-3. Edit the `udmi_site_model/cloud_iot_config.json` file
-4. Edit the gateway `/udmi_site_model/devices/CGW-1/metadata.json` file
-5. Generate Private/Public key pair example using openssl. Put the `private key` /udmi_site_model/devices/CGW-1/rsa_private.pem. Upload `public key` rsa_pubic.pem to your gcCLoud IoTEdge device gateway e.g CGW-1
-6. Edit the devices `/udmi_site_model/devices/EM-1/metadata.json` file
-
-### Example
-```
-# For gateway e.g CGW-1 modify the following properties according to your cloud enviornment
-  and child devices connected to it
-
-  Note: guid must be different for gateway as well as devices 
-        which can be created from command line tool
-
-{
-  "system": {
-    "location": {
-      "site": "KGX-1",
-    },
-    "physical_tag": {
-      "asset": {
-        "guid": "guid://a8159395-2d69-4480-8252-8b678f6813da",
-        "site": "KGX-1",
-        "name": "CGW-1"
-      }
-    }
-  },
-  "gateway": {
-    "proxy_ids": [ "EM-1", "EM-2" ]
-
-
-# For devices e.g EM-1 modify the following properties according to your cloud enviornment
-
-  "system": {
-    "location": {
-      "site": "KGX-1",
-    },
-    "physical_tag": {
-      "asset": {
-        "guid": "guid//0757e4fc-dc8f-4cbe-9471-19336531f608",
-        "site": "KGX-1",
-        "name": "EM-E"
-      }
-    }
-  },
-  "gateway": {
-    "gateway_id": "CGW-1"
-  }
-```
 ## Usage
-After installation and configuration, you can run the project as follows:
-
-### Running the connector:
+### Running the Gateway
 ```bash
-cd /home/moxa/moxa-gcloud-udmi
-sudo python3.9 src/main.py
+python3 src/main.py -c resources/config-google-gateway.json
 ```
-By default code run in debug mode. To suppress debug information run code with -v3 argument 
+
+Useful CLI overrides:
 ```bash
-sudo python3.9 src/main.py -v3
+python3 src/main.py \
+  -c resources/config-cgw2-example.json \
+  -iot-provider gbos \
+  -google-cloud-project-id <PROJECT_ID> \
+  -google-cloud-hostname europe-west1-mqtt.clearblade.com \
+  -site-details-registry-id UK-LON-GLAB \
+  -site-details-gateway-id CGW-2 \
+  -serial-no CGW2-UC8220-001 \
+  -v 3
 ```
-## Contributing 
 
-We welcome contributions to the Moxa GCloud UDMI Integration project. To contribute:
+For local UDMI MQTT reflector testing (`//mqtt/localhost`):
+```bash
+python3 src/main.py \
+  -c resources/config-cgw2-example.json \
+  -iot-provider mqtt \
+  -google-cloud-hostname localhost \
+  -google-cloud-port 8883 \
+  -udmi-site-model-path /path/to/site_model
+```
 
+## Local Testing & UDMI Sequencer Verification
+Run the automated compliance & end-to-end test suite:
+```bash
+pytest
+```
+
+To simulate Moxa `MXcloudgate` Modbus RTU traffic locally against a Mosquitto broker for `EM-11` (slave 1), `EM-12` (slave 2), and `EM-13` (slave 3):
+```bash
+python3 tools/mxcloudgate_simulator.py --host 127.0.0.1 --port 1883 --slaves 1,2,3 --interval 2.0
+```
+
+## Contributing
 1. Fork the repository.
-2. Create a new branch for your feature or bugfix.
-3. Submit a pull request with a detailed explanation of your changes.
+2. Create a feature branch (`git checkout -b feature/my-improvement`).
+3. Ensure `pytest` passes and UDMI `registrar` reports `"CLEAN"` on `udmi_site_model/`.
+4. Submit a pull request.
 
 ## License
-This project is licensed under the GPLv3.0 License - see the LICENSE file for details.
+This project is licensed under the GPLv3.0 License - see the [LICENSE](LICENSE) file for details.
 
 ## Contact
-For more information or questions, please contact the repository maintainer:
 Moxa Europe GmbH - meuiiot@moxa.com

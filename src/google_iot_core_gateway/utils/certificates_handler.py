@@ -11,35 +11,53 @@ import sys
 # from cryptography.x509.oid import NameOID
 
 
-def get_google_root_ca(resources_path):
+def get_google_root_ca(resources_path, custom_ca_cert=None):
     """
-    Get Google IoT Core root cert
+    Get Google IoT Core root cert or custom CA certificate path.
     """
+    if custom_ca_cert:
+        return custom_ca_cert
     return os.path.join(resources_path, "roots.pem")
 
 
-def get_gateway_private_key(logger, udmi_site_model_path, gateway_id):
+def get_gateway_private_key(logger, udmi_site_model_path, gateway_id, required=True):
     """
     Get private key file, for the Google IoT Core authentication
     Args:
         logger: Logger
         udmi_site_model_path: UDMI Site Model path
         gateway_id: ID of Google Iot Core gateway device
+        required: Exit if private key is missing
     Returns:
-        Gateway private key
+        Tuple of (private_key_path, algorithm, pkcs8_key_path)
     """
-    udmi_site_model_path = os.path.join(udmi_site_model_path, "devices", gateway_id)
+    device_dir = os.path.join(udmi_site_model_path, "devices", gateway_id)
 
-    private_key_file_path = os.path.join(udmi_site_model_path, "rsa_private.pem")
-    if os.path.exists(private_key_file_path):
-        return private_key_file_path, "RS256"
+    candidates = [
+        ("rsa_private.pem", "RS256"),
+        ("ec_private.pem", "ES256"),
+    ]
+    for filename, algorithm in candidates:
+        private_key_file_path = os.path.join(device_dir, filename)
+        if os.path.exists(private_key_file_path):
+            return private_key_file_path, algorithm
 
-    private_key_file_path = os.path.join(udmi_site_model_path, "ec_private.pem")
-    if os.path.exists(private_key_file_path):
-        return private_key_file_path, "ES256"
+    # Fallback: check PKCS8 PEM or convert/detect if only .pkcs8 exists in UDMI site model
+    pkcs8_candidates = [
+        ("rsa_private.pkcs8", "RS256"),
+        ("ec_private.pkcs8", "ES256"),
+    ]
+    for filename, algorithm in pkcs8_candidates:
+        pkcs8_path = os.path.join(device_dir, filename)
+        if os.path.exists(pkcs8_path):
+            return pkcs8_path, algorithm
+
+    if not required:
+        logger.warning(f"No private key found at '{device_dir}'; continuing without JWT key.")
+        return None, "RS256"
 
     logger.error(
-        f"Private key not found! Please make sure that either 'rsa_private.pem' or 'ec_private.pem' file is at '{udmi_site_model_path}' path")
+        f"Private key not found! Please make sure that either 'rsa_private.pem' or 'ec_private.pem' file is at '{device_dir}' path")
     sys.exit(1)
 
 # def _generate_rsa_key():

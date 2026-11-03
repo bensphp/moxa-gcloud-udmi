@@ -211,3 +211,7 @@ fabric.properties
 
 # Android studio 3.1+ serialized cache file
 .idea/caches/build_file_checksums.ser
+
+# UDMI private keys and generated tool outputs
+*_private.*
+udmi_site_model/**/out/

@@ -1,38 +1,43 @@
 {
-    
-    "internal_broker": {
-        "mqtt_bridge_hostname": "Moxa",
-        "mqtt_bridge_port": 1883,
-        "enable_tls": false,
-        "trusted_root_ca": "./resources/certs/ca.crt",
-        "x509_certificate": null,
-        "private_key": null
-
-    },
-    "google_cloud": {
-        "project_id": "your-clearblade-project-id",
-        "sample_rate_set": 5,
-        "mqtt_bridge_hostname": "your-mqtt-hostname",
-        "mqtt_bridge_port": 8883
-    },
-    "site_details": {
-        "gateway_id": "CGW-1",
-        "proxy_ids": {
-            "EM-1": {
-                "type": "PM5561",
-                "modbus_slave_id": 1
-            },
-            "EM-2": {
-                "type": "PM5111",
-                "modbus_slave_id": 2
-            },
-            "EM-3": {
-                "type": "PM8240",
-                "modbus_slave_id": 3
-            }
-        }
-    },
-    "environment_setup": {
-        "udmi_site_model_path": "/home/moxa/moxa-gcloud-udmi/udmi_site_model"
+  "internal_broker": {
+    "mqtt_bridge_hostname": "127.0.0.1",
+    "mqtt_bridge_port": 1883,
+    "enable_tls": false,
+    "trusted_root_ca": "./resources/certs/ca.crt",
+    "x509_certificate": null,
+    "private_key": null
+  },
+  "google_cloud": {
+    "iot_provider": "gbos",
+    "cloud_region": "europe-west1",
+    "project_id": "your-clearblade-project-id",
+    "sample_rate_set": 10,
+    "mqtt_bridge_hostname": "your-mqtt-hostname",
+    "mqtt_bridge_port": 8883,
+    "enable_tls": true
+  },
+  "site_details": {
+    "gateway_id": "CGW-2",
+    "serial_no": "CGW2-UC8220-001",
+    "proxy_ids": {
+      "EM-11": {
+        "type": "PM5561",
+        "modbus_slave_id": 1,
+        "serial_no": "EM-11-SN-001"
+      },
+      "EM-12": {
+        "type": "PM5111",
+        "modbus_slave_id": 2,
+        "serial_no": "EM-12-SN-002"
+      },
+      "EM-13": {
+        "type": "PM8240",
+        "modbus_slave_id": 3,
+        "serial_no": "EM-13-SN-003"
+      }
     }
+  },
+  "environment_setup": {
+    "udmi_site_model_path": "/home/moxa/moxa-gcloud-udmi/udmi_site_model"
+  }
 }
