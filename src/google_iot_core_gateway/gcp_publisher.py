@@ -13,6 +13,7 @@ import hashlib
 import logging
 import os
 import queue
+import socket
 import ssl
 import threading
 import time
@@ -103,6 +104,7 @@ class GoogleIoTCoreMQTTPublisher:
         self._connection_generation = 0
         self._started = False
         self._jwt_exp = None
+        self._tls_context = None
         self._log_throttle = {}
 
         # Downlink queues consumed by gcp_handler (config is never dropped; errors are bounded).
@@ -209,8 +211,16 @@ class GoogleIoTCoreMQTTPublisher:
             if path and not os.path.exists(path):
                 raise GatewayConfigError(f"Configured {label} file '{path}' not found")
 
-        context = ssl.create_default_context(cafile=ca_certs)
+        # Same verification on every Python version: certificate + hostname checks (CERT_REQUIRED,
+        # check_hostname) with TLS >= 1.2. ssl.create_default_context() is not used because from
+        # Python 3.13 it also enables VERIFY_X509_STRICT, which rejects common private CAs (e.g.
+        # the UDMI reflector CA) that Python 3.9-3.12 and paho's own tls_set() accept.
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         context.minimum_version = ssl.TLSVersion.TLSv1_2
+        if ca_certs:
+            context.load_verify_locations(cafile=ca_certs)
+        else:
+            context.load_default_certs()
         if self._client_cert:
             context.load_cert_chain(self._client_cert, self._client_key or None)
         return context
@@ -229,11 +239,13 @@ class GoogleIoTCoreMQTTPublisher:
             self._refresh_jwt_credentials()
 
         if self._enable_tls:
-            client.tls_set_context(self._build_tls_context())
+            self._tls_context = self._build_tls_context()
+            client.tls_set_context(self._tls_context)
 
         client.reconnect_delay_set(min_delay=RECONNECT_MIN_DELAY_SEC, max_delay=RECONNECT_MAX_DELAY_SEC)
         client.max_queued_messages_set(MAX_QUEUED_MESSAGES)
         client.on_connect = self.on_connect
+        client.on_connect_fail = self.on_connect_fail
         client.on_disconnect = self.on_disconnect
         client.on_publish = self.on_publish
         client.on_message = self.on_message
@@ -342,6 +354,32 @@ class GoogleIoTCoreMQTTPublisher:
                 self._attached_proxy_ids.add(device_id)
             self._connection_generation += 1
         self._connected.set()
+
+    def on_connect_fail(self, client, user_data, *args):
+        """TCP/TLS connection attempt failed (paho retries with backoff): say why, rate-limited."""
+        self._connected.clear()
+        now = time.monotonic()
+        last = self._log_throttle.get(("connect_fail",))
+        if last is not None and now - last < LOG_THROTTLE_SEC:
+            return
+        self._log_throttle[("connect_fail",)] = now
+        self.logger.error(
+            f"Cannot connect to MQTT bridge {self._mqtt_bridge_hostname}:{self._mqtt_bridge_port}: "
+            f"{self._diagnose_connection()}; retrying with backoff"
+        )
+
+    def _diagnose_connection(self) -> str:
+        """Reproduce the TCP/TLS handshake once to report a concrete reason (e.g. CA mismatch)."""
+        try:
+            with socket.create_connection(
+                (self._mqtt_bridge_hostname, self._mqtt_bridge_port), timeout=5.0
+            ) as raw:
+                if self._tls_context is None:
+                    return "TCP connection works; the MQTT handshake failed"
+                with self._tls_context.wrap_socket(raw, server_hostname=self._mqtt_bridge_hostname):
+                    return "TCP/TLS handshake works; the MQTT handshake failed"
+        except (OSError, ValueError) as exc:
+            return f"{type(exc).__name__}: {exc}"
 
     def on_disconnect(self, client, user_data, *args):
         rc = args[-1] if args else 0

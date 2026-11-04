@@ -266,3 +266,94 @@ def test_fatal_configuration_errors_exit_non_zero(tmp_path):
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60, check=False,
     )
     assert proc.returncode == EXIT_FATAL
+
+
+def _make_ca(common_name):
+    """Private CA without a keyUsage extension, like the UDMI reflector test CA."""
+    import datetime as dt
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, common_name)])
+    now = dt.datetime.now(dt.timezone.utc)
+    cert = (
+        x509.CertificateBuilder().subject_name(name).issuer_name(name).public_key(key.public_key())
+        .serial_number(x509.random_serial_number()).not_valid_before(now - dt.timedelta(days=1))
+        .not_valid_after(now + dt.timedelta(days=30))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .sign(key, hashes.SHA256())
+    )
+    return key, cert
+
+
+def _write_server_cert(tmp_path, ca_key, ca_cert):
+    import datetime as dt
+    import ipaddress
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    now = dt.datetime.now(dt.timezone.utc)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")]))
+        .issuer_name(ca_cert.subject).public_key(key.public_key())
+        .serial_number(x509.random_serial_number()).not_valid_before(now - dt.timedelta(days=1))
+        .not_valid_after(now + dt.timedelta(days=30))
+        .add_extension(x509.SubjectAlternativeName(
+            [x509.DNSName("localhost"), x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]), critical=False)
+        .sign(ca_key, hashes.SHA256())
+    )
+    pem = serialization.Encoding.PEM
+    (tmp_path / "ca.crt").write_bytes(ca_cert.public_bytes(pem))
+    (tmp_path / "server.crt").write_bytes(cert.public_bytes(pem))
+    (tmp_path / "server.key").write_bytes(
+        key.private_bytes(pem, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
+
+
+def test_tls_connection_verifies_the_broker(tmp_path, logger, caplog):
+    from cryptography.hazmat.primitives import serialization
+
+    ca_key, ca_cert = _make_ca("Test CA")
+    _write_server_cert(tmp_path, ca_key, ca_cert)
+    _other_key, other_ca = _make_ca("Unrelated CA")
+    (tmp_path / "other-ca.crt").write_bytes(other_ca.public_bytes(serialization.Encoding.PEM))
+
+    port = find_free_port()
+    conf = tmp_path / "tls.conf"
+    conf.write_text(
+        f"listener {port} 127.0.0.1\nallow_anonymous true\ncafile {tmp_path / 'ca.crt'}\n"
+        f"certfile {tmp_path / 'server.crt'}\nkeyfile {tmp_path / 'server.key'}\n",
+        encoding="utf-8",
+    )
+    broker = subprocess.Popen([MOSQUITTO, "-c", str(conf)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    publishers = []
+    try:
+        _wait_port(port)
+
+        def _publisher(ca_file):
+            pub = GoogleIoTCoreMQTTPublisher(
+                logger, {}, project_id="local", cloud_region="europe-west1", registry_id="UK-LON-GLAB",
+                gateway_id="CGW-2", private_key_file=None, ca_cert=str(ca_file), ca_cert_required=True,
+                mqtt_bridge_hostname="localhost", mqtt_bridge_port=port, iot_provider="mqtt", enable_tls=True,
+            )
+            publishers.append(pub)
+            return pub
+
+        assert _publisher(tmp_path / "ca.crt").wait_for_connection(10)
+        with caplog.at_level("ERROR"):
+            untrusted = _publisher(tmp_path / "other-ca.crt")
+            assert not untrusted.wait_for_connection(3)
+        assert any("certificate verify failed" in rec.getMessage() for rec in caplog.records)
+    finally:
+        for pub in publishers:
+            pub.close()
+        broker.terminate()
+        broker.wait(timeout=5)
