@@ -14,7 +14,8 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = REPO_ROOT / "src"
 TOOLS_DIR = REPO_ROOT / "tools"
-for _path in (SRC_DIR, TOOLS_DIR):
+TESTS_DIR = Path(__file__).resolve().parent
+for _path in (SRC_DIR, TOOLS_DIR, TESTS_DIR):
     if str(_path) not in sys.path:
         sys.path.insert(0, str(_path))
 

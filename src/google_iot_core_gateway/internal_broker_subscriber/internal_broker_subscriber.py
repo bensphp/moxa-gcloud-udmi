@@ -54,7 +54,8 @@ class MosquittoMQTTSubscriber:
         self.client.on_publish = self._on_publish
         self.client.on_subscribe = self._on_subscribe
         self.client.on_message = self._on_message
-        self.client.on_log = self._on_log
+        if self.logger.isEnabledFor(logging.DEBUG):
+            self.client.on_log = self._on_log
 
         if self._enable_tls:
             # paho picks PROTOCOL_TLS_CLIENT (TLS 1.2+, certificate verification on).
@@ -77,13 +78,11 @@ class MosquittoMQTTSubscriber:
     def _on_connect(self, client, user_data, flags, rc, *args):
         self.logger.debug(f"on_connect: {mqtt.connack_string(rc)}")
         if rc == 0:
-            self.logger.info("*************************************************************")
             self.logger.info(
                 "Connected successfully to MXcloudgate internal broker: {}:{}".format(
                     self._broker_url, self._port
                 )
             )
-            self.logger.info("*************************************************************")
             self.logger.info(f"Subscribing to internal broker topic '{self._topic}'")
             client.subscribe(self._topic, 0)
         else:

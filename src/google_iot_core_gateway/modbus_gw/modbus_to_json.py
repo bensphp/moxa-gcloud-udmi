@@ -116,6 +116,19 @@ def describe_modbus_exception(code: int) -> str:
     return f"Modbus exception code 0x{code:02x} ({name})"
 
 
+def _shortest_float32(value: float, raw: bytes) -> float:
+    """Shortest decimal that maps back to exactly the FLOAT32 the meter sent.
+
+    230.1 is published as 230.1 (not 230.10000610351562) and no precision is lost: 6-9
+    significant digits always suffice to round-trip a FLOAT32.
+    """
+    for digits in range(6, 10):
+        candidate = float(format(value, f".{digits}g"))
+        if struct.pack(">f", candidate) == raw:
+            return candidate
+    return float(value)
+
+
 def _get_dbo_properties(mapping_dict, register_address):
     dbo_properties = mapping_dict[str(register_address)]
     total_registers = int(dbo_properties["number_of_registers"])
@@ -179,22 +192,6 @@ def _read_ext_config(directory, filename, config_file=None):
         return None
 
 
-def map_modbus_slave_to_type(ext_conf):
-    """
-    Map integer modbus_slave_id -> meter type string (e.g. {1: 'PM5561', 2: 'PM5111'}).
-    """
-    if not isinstance(ext_conf, dict):
-        return {}
-    proxy_ids = ext_conf.get("site_details", {}).get("proxy_ids")
-    if not isinstance(proxy_ids, dict):
-        return {}
-    transformed_dict = {}
-    for _device, details in proxy_ids.items():
-        if isinstance(details, dict) and "modbus_slave_id" in details and "type" in details:
-            transformed_dict[int(details["modbus_slave_id"])] = details["type"]
-    return transformed_dict
-
-
 def decode_register_bytes(byte_value: bytes, data_format: str):
     """
     Decode raw big-endian (high word first) Modbus register bytes per the meter map format.
@@ -222,9 +219,7 @@ def decode_register_bytes(byte_value: bytes, data_format: str):
         if math.isnan(value) or math.isinf(value):
             return DECODE_NOT_AVAILABLE, None
         if fmt == "float32":
-            # FLOAT32 carries ~7 significant digits: 230.1 instead of 230.10000610351562, without
-            # losing small values (fixed decimal rounding would turn 4e-07 into 0.0).
-            return DECODE_OK, float(format(value, ".7g"))
+            return DECODE_OK, _shortest_float32(value, byte_value)
         return DECODE_OK, float(value)
     if _INT_NOT_AVAILABLE.get(fmt) == value:
         return DECODE_NOT_AVAILABLE, None
@@ -316,11 +311,7 @@ def build_fc3_fc4_payload(
     ):
         return _error_payload(payload, ERROR_FRAMING, "Invalid Modbus RTU response framing")
 
-    if slave_to_type is None:
-        ext_conf = _read_ext_config("resources", "config-google-gateway.json")
-        site_devices = map_modbus_slave_to_type(ext_conf)
-    else:
-        site_devices = {int(k): v for k, v in slave_to_type.items()}
+    site_devices = {int(k): v for k, v in (slave_to_type or {}).items()}
 
     if resp_slave_id not in site_devices:
         logger.debug(f"Response slave ID {resp_slave_id} is not configured in site_details")

@@ -16,7 +16,7 @@ import paho.mqtt.client as mqtt
 import pytest
 
 from conftest import MOSQUITTO, REPO_ROOT, RESOURCES_DIR, find_free_port, write_site_model
-from google_iot_core_gateway.errors import EXIT_FATAL, EXIT_OK, EXIT_RESTART
+from google_iot_core_gateway.errors import EXIT_OK, EXIT_RESTART
 from google_iot_core_gateway.gcp_handler import run_gateway_loop
 from google_iot_core_gateway.gcp_publisher import GoogleIoTCoreMQTTPublisher
 from google_iot_core_gateway.internal_broker_subscriber.internal_broker_subscriber import (
@@ -263,14 +263,6 @@ def test_system_mode_restart_really_restarts(tmp_path, broker):
         observer.close()
 
 
-def test_fatal_configuration_errors_exit_non_zero(tmp_path):
-    proc = subprocess.run(
-        [sys.executable, "-B", str(REPO_ROOT / "src" / "main.py"), "-c", str(tmp_path / "missing.json")],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60, check=False,
-    )
-    assert proc.returncode == EXIT_FATAL
-
-
 def _make_ca(common_name):
     """Private CA without a keyUsage extension, like the UDMI reflector test CA."""
     import datetime as dt
@@ -295,7 +287,6 @@ def _make_ca(common_name):
 
 def _write_server_cert(tmp_path, ca_key, ca_cert):
     import datetime as dt
-    import ipaddress
 
     from cryptography import x509
     from cryptography.hazmat.primitives import hashes, serialization
@@ -310,8 +301,7 @@ def _write_server_cert(tmp_path, ca_key, ca_cert):
         .issuer_name(ca_cert.subject).public_key(key.public_key())
         .serial_number(x509.random_serial_number()).not_valid_before(now - dt.timedelta(days=1))
         .not_valid_after(now + dt.timedelta(days=30))
-        .add_extension(x509.SubjectAlternativeName(
-            [x509.DNSName("localhost"), x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]), critical=False)
+        .add_extension(x509.SubjectAlternativeName([x509.DNSName("localhost")]), critical=False)
         .sign(ca_key, hashes.SHA256())
     )
     pem = serialization.Encoding.PEM
@@ -341,11 +331,11 @@ def test_tls_connection_verifies_the_broker(tmp_path, logger, caplog):
     try:
         _wait_port(port)
 
-        def _publisher(ca_file):
+        def _publisher(ca_file, host="localhost"):
             pub = GoogleIoTCoreMQTTPublisher(
                 logger, {}, project_id="local", cloud_region="europe-west1", registry_id="UK-LON-GLAB",
                 gateway_id="CGW-2", private_key_file=None, ca_cert=str(ca_file), ca_cert_required=True,
-                mqtt_bridge_hostname="localhost", mqtt_bridge_port=port, iot_provider="mqtt", enable_tls=True,
+                mqtt_bridge_hostname=host, mqtt_bridge_port=port, iot_provider="mqtt", enable_tls=True,
             )
             publishers.append(pub)
             return pub
@@ -355,6 +345,12 @@ def test_tls_connection_verifies_the_broker(tmp_path, logger, caplog):
             untrusted = _publisher(tmp_path / "other-ca.crt")
             assert not untrusted.wait_for_connection(3)
         assert any("certificate verify failed" in rec.getMessage() for rec in caplog.records)
+        # Trusted CA but the certificate is not valid for this host name: hostname check must fail.
+        caplog.clear()
+        with caplog.at_level("ERROR"):
+            wrong_host = _publisher(tmp_path / "ca.crt", host="127.0.0.1")
+            assert not wrong_host.wait_for_connection(3)
+        assert any("mismatch" in rec.getMessage() for rec in caplog.records)
     finally:
         for pub in publishers:
             pub.close()

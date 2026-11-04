@@ -26,60 +26,8 @@ from google_iot_core_gateway.udmi_handler.udmi_handler import (
     parse_modbus_ref,
 )
 from conftest import META_METER_IDENTITY, RESOURCES_DIR, write_site_model
-
-V = "1.5.2"
-
-
-def _config(ts, **blocks):
-    cfg = {"version": V, "timestamp": ts, "system": {"min_loglevel": LEVEL_INFO}}
-    cfg.update(blocks)
-    return json.dumps(cfg)
-
-
-def _em11_config(ts="2026-11-04T10:00:00Z", points=None, target=None, rate=10):
-    return _config(
-        ts,
-        gateway={"target": target or {"family": "modbus"}},
-        localnet={"families": {"modbus": {}}},
-        pointset={
-            "sample_rate_sec": rate,
-            "points": points
-            or {
-                "line1_neutral_voltage_sensor": {"ref": "3/3028/2?type=FLOAT32"},
-                "frequency_sensor": {"ref": "3/3110/2?type=FLOAT32"},
-            },
-        },
-    )
-
-
-def _frame(regs, slave=1, start=3028, qty=2, unavailable=None):
-    return {
-        "slave_id": slave,
-        "fc": 3,
-        "start_register": start,
-        "quantity": qty,
-        "data": {str(k): v for k, v in regs.items()},
-        "unavailable": {str(k): "N/A(ffc00000)" for k in (unavailable or [])},
-        "error": None,
-    }
-
-
-def _exception(code, start, qty, slave=1):
-    return {
-        "slave_id": slave,
-        "fc": 3,
-        "start_register": start,
-        "quantity": qty,
-        "data": None,
-        "unavailable": {},
-        "error": f"Modbus exception code 0x{code:02x}",
-        "error_kind": "exception",
-        "exception_code": code,
-    }
-
-
-def _state(handler, device="EM-11"):
-    return json.loads(handler.get_state_payload(device))
+from helpers import config as _config, em11_config as _em11_config, exception_reply as _exception
+from helpers import V, frame as _frame, state_of as _state
 
 
 class TestConfigHandling:

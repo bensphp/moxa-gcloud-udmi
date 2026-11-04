@@ -4,6 +4,8 @@ import argparse
 import json
 import os
 import queue
+import signal
+import threading
 import time
 from queue import Empty
 
@@ -366,8 +368,8 @@ def process_downlink_configs(logger, google_iot_core_publisher, udmi_handler):
 def process_gateway_errors(google_iot_core_publisher, udmi_handler):
     """Surface cloud `errors` topic messages (e.g. failed proxy attach) in the gateway state."""
     errors = google_iot_core_publisher.drain_gateway_errors()
-    for device_id, payload in errors:
-        udmi_handler.record_gateway_error(device_id, payload)
+    for device_id, payload, generation in errors:
+        udmi_handler.record_gateway_error(device_id, payload, generation)
     return len(errors)
 
 
@@ -469,7 +471,7 @@ def run_gateway_loop(logger, config, google_iot_core_publisher, udmi_handler, go
             # New MQTT session: anything sent on the old one may be lost, so send state again;
             # proxies are re-attached, so earlier cloud attach errors no longer apply.
             last_generation = generation
-            udmi_handler.clear_attach_errors()
+            udmi_handler.clear_attach_errors(before_generation=generation)
             udmi_handler.force_republish_all()
 
         if google_iot_core_publisher.is_connected():
@@ -545,12 +547,16 @@ def start_google_iot_core_gateway(logger, args, root_dir=None, stop_event=None):
 
 
 def start_standalone_google_iot_core_gateway(assigned_args=None, logger=None, stop_event=None):
-    """Standalone entry point for `python -m google_iot_core_gateway`."""
+    """Standalone entry point for `python -m google_iot_core_gateway` (same exit codes as main.py)."""
     args = parse_command_line_args(
         args=assigned_args, parents=[get_google_cloud_cmd_line_parser()]
     )
     if not logger:
         logger = setup_logger()
+    if stop_event is None and threading.current_thread() is threading.main_thread():
+        stop_event = threading.Event()
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            signal.signal(signum, lambda _signum, _frame: stop_event.set())
     return start_google_iot_core_gateway(logger, args, stop_event=stop_event)
 
 

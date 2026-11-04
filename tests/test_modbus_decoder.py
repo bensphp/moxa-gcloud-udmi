@@ -61,6 +61,14 @@ class TestDecoder:
             req, resp = _frames(3028, 2, struct.pack(">f", value))
             assert _decode(req, resp)["data"]["3028"] == pytest.approx(value, rel=1e-6)
 
+    @pytest.mark.parametrize("value", [230.1, 400.34393310546875, 12.226648330688477, 0.985, 1e-07, 123456.78])
+    def test_float32_values_round_trip_exactly(self, value):
+        raw = struct.pack(">f", value)
+        req, resp = _frames(3028, 2, raw)
+        decoded = _decode(req, resp)["data"]["3028"]
+        assert struct.pack(">f", decoded) == raw  # exactly the FLOAT32 the meter sent
+        assert len(repr(decoded)) <= len(repr(struct.unpack(">f", raw)[0]))
+
     def test_request_length_is_checked(self):
         _, resp = _frames(3028, 2, struct.pack(">f", 230.5))
         seven_byte_request = struct.pack(">BBHH", 1, 3, 3027, 2) + b"\x00"

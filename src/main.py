@@ -32,7 +32,7 @@ from google_iot_core_gateway.utils.log import setup_logger  # noqa: E402
 
 logger = setup_logger()
 
-SHUTDOWN_GRACE_SEC = 10.0
+SHUTDOWN_GRACE_SEC = 15.0
 
 
 def get_internal_broker_cmd_line_parser() -> argparse.ArgumentParser:

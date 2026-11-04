@@ -18,7 +18,7 @@
 - [License](#license)
 
 ## Overview
-The **Moxa GCloud UDMI Integration** (`v4.3.0`) runs on Moxa industrial gateways such as the
+The **Moxa GCloud UDMI Integration** (`v4.3.1`) runs on Moxa industrial gateways such as the
 **UC-8220** (Debian 11, Python 3.9). Moxa `MXcloudgate` polls Modbus RTU energy meters (Schneider
 Electric PM5561, PM5111, PM8240) and publishes the raw request/response frames on a local MQTT
 broker. This gateway decodes those frames and acts as a **UDMI 1.5** gateway (e.g. `CGW-2`) for the
@@ -63,7 +63,8 @@ Telemetry health:
 - **Config handling**: `system.config.receive/parse/apply` logging honouring `min_loglevel`
   (default 300); broken configs set `system.status` and keep `last_config`; configs are applied
   atomically (a failing config changes nothing); unknown fields are tolerated; state blocks mirror
-  the config blocks. A `pointset` block without points means "all readable points".
+  the config blocks. A `pointset` block without a `points` object means "all readable points";
+  an empty `points` object means no points.
 - **State publishing**: only on change, at most every 2.1 s (12 s for health-only changes); a state
   the MQTT client did not accept is re-sent, and state is always re-sent after a (re)connect.
   Nothing is published while disconnected.
@@ -92,8 +93,8 @@ Telemetry health:
   (`jwt_expires_minutes`, 10-1440, default 60) are refreshed before expiry by reconnecting the same
   client, so unacknowledged QoS 1 messages are re-sent.
 - **Modbus RTU decoding**: CRC-16 checked on responses and on 8-byte requests (configurable),
-  exception responses, FLOAT32 (7 significant digits)/FLOAT64, INT16/32/64 (signed/unsigned) and
-  ASCII registers.
+  exception responses, FLOAT32 (published as the shortest decimal that maps back to the exact value)/
+  FLOAT64, INT16/32/64 (signed/unsigned) and ASCII registers.
 
 ## Project Structure
 ```plaintext
@@ -161,7 +162,7 @@ describe the real installation:
   what self-enumeration returns); refs use the grammar above, e.g. `3/3028/2?type=FLOAT32` with
   `localnet.families.modbus` = `{"addr": "<port>", "unitid": "<slave id>"}`.
 - **Gateway**: `localnet.families` must contain only the gateway's real addresses (no `ipv6` unless
-  it has a global IPv6 address); `software` must match the running version (`{"firmware": "4.3.0"}`).
+  it has a global IPv6 address); `software` must match the running version (`{"firmware": "4.3.1"}`).
   The gateway has no points, so it has no `pointset` block.
 - **Features** must equal what the code implements:
   - gateway: `system` (stable), `gateway`, `system.mode`, `enumeration`, `enumeration.families`,

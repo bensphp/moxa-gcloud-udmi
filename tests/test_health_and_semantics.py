@@ -1,6 +1,6 @@
 # This software is licensed under GNU GENERAL PUBLIC LICENSE Version 3, 29 June 2007
 
-"""Regression tests for issues found in the second review round."""
+"""Telemetry health, connectivity, identity publishing and config semantics."""
 
 import json
 import queue
@@ -15,7 +15,8 @@ from google_iot_core_gateway.udmi_handler.udmi_handler import (
     HEALTH_STATE_THROTTLE_SEC,
 )
 from conftest import RESOURCES_DIR, write_site_model
-from test_udmi_handler import _config, _em11_config, _exception, _frame, _state
+from helpers import config as _config, em11_config as _em11_config, exception_reply as _exception
+from helpers import frame as _frame, state_of as _state
 
 
 def _error(kind, slave=1):
@@ -107,10 +108,21 @@ def test_unit_conversion_requests_are_rejected(handler_factory):
     assert json.loads(h.get_event_point_payload("EM-11"))["points"] == {}
 
 
+def test_unit_spelling_differences_are_not_conversions(handler_factory):
+    h = handler_factory()
+    h.handle_config("EM-11", _em11_config(points={"frequency_sensor": {"units": "hertz"}}))
+    h.record_modbus_payload(_frame({3110: 50.0}, start=3110, qty=2))
+    assert _state(h)["pointset"]["points"]["frequency_sensor"] == {}
+
+
 def test_config_without_points_uses_all_readable_points(handler_factory):
     h = handler_factory()
     h.handle_config("EM-11", _config("2026-11-04T10:00:00Z", pointset={"sample_rate_sec": 10}))
     assert len(_state(h)["pointset"]["points"]) == 42
+    # An explicit empty points object is authoritative: no points.
+    h.handle_config("EM-11", _config("2026-11-04T10:00:01Z", pointset={"sample_rate_sec": 10, "points": {}}))
+    assert _state(h)["pointset"]["points"] == {}
+    assert h.pop_due_pointset_event_payload("EM-11", now_mono=time.monotonic() + 60) is None
 
 
 def test_unknown_proxy_ids_are_reported(handler_factory):
@@ -119,6 +131,8 @@ def test_unknown_proxy_ids_are_reported(handler_factory):
     status = _state(h, "CGW-2")["gateway"]["status"]
     assert status["category"] == CATEGORY_GATEWAY_SETUP_ATTACH
     assert "EM-99" in status["message"]
+    entries = json.loads(h.pop_due_system_event_payload("CGW-2"))["logentries"]
+    assert any(e["category"] == CATEGORY_GATEWAY_SETUP_ATTACH and "EM-99" in e["message"] for e in entries)
 
 
 def test_health_only_changes_are_rate_limited(handler_factory):

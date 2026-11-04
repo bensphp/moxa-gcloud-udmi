@@ -417,7 +417,7 @@ class GoogleIoTCoreMQTTPublisher:
         if subtopic == "config":
             self.config_queue.put((device_id, payload))
         elif subtopic == "errors":
-            self._gateway_errors.append((device_id, payload))
+            self._gateway_errors.append((device_id, payload, self._connection_generation))
 
     def drain_gateway_errors(self) -> list:
         drained = []

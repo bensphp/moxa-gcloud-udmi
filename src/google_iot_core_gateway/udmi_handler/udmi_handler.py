@@ -143,6 +143,11 @@ _FORMAT_TO_MODBUS_TYPE = {
 }
 
 
+def _normalize_units(units) -> str:
+    """Compare unit names case-insensitively and ignoring separators ("Volts" == "volts")."""
+    return re.sub(r"[\s_-]+", "", str(units)).lower()
+
+
 def parse_modbus_ref(ref: str, unit_from_context: bool) -> dict:
     """
     Parse a UDMI Modbus point reference.
@@ -547,6 +552,7 @@ class UDMIHandler:
             "attach_status": None,
             "attach_errors": {},
             "attach_error_seen": {},
+            "attach_error_generation": {},
             "proxy_config_status": None,
             # Proxy communication health
             "last_rx_mono": None,
@@ -882,21 +888,6 @@ class UDMIHandler:
                 self._refresh_dirty_flag_locked(dev)
             self._refresh_health_locked(dev, now)
 
-    def update_device_properties(self, modbus_slave_id, device_type, registry_number, value):
-        """Backward-compatible single-register update (value=None marks "not available")."""
-        payload = {"slave_id": modbus_slave_id, "data": {}, "unavailable": {}}
-        if value is None:
-            payload["unavailable"][str(registry_number)] = "N/A"
-        elif isinstance(value, bool):
-            return
-        else:
-            payload["data"][str(registry_number)] = value
-        with self._lock:
-            dev = self.devices.get(str(modbus_slave_id))
-            if dev is None or dev.get("device_type") != str(device_type):
-                return
-        self.record_modbus_payload(payload)
-
     def _apply_point_value_locked(self, dev: dict, point_name, value, now: float):
         if not point_name or point_name not in dev["points"]:
             return
@@ -971,7 +962,7 @@ class UDMIHandler:
         pt_cfg = pt_cfg if isinstance(pt_cfg, dict) else {}
         native_units = dev["known_points"][point_name].get("units")
         cfg_units = pt_cfg.get("units")
-        if cfg_units and native_units and str(cfg_units) != str(native_units):
+        if cfg_units and native_units and _normalize_units(cfg_units) != _normalize_units(native_units):
             return "invalid", (
                 CATEGORY_POINTSET_POINT_INVALID,
                 LEVEL_ERROR,
@@ -1079,8 +1070,12 @@ class UDMIHandler:
 
     # ------------------------------------------------------------------ errors
 
-    def record_gateway_error(self, device_id, raw_payload):
-        """Surface a cloud `errors` topic message (e.g. failed proxy attach) in gateway status."""
+    def record_gateway_error(self, device_id, raw_payload, generation=None):
+        """Surface a cloud `errors` topic message (e.g. failed proxy attach) in gateway status.
+
+        `generation` is the MQTT session the message arrived on, so errors answering the current
+        session survive the clean-up of older ones.
+        """
         with self._lock:
             gw = self.devices_by_id.get(self.gateway_id)
             if gw is None:
@@ -1104,6 +1099,7 @@ class UDMIHandler:
             entry = self.make_entry(CATEGORY_GATEWAY_SETUP_ATTACH, LEVEL_ERROR, message)
             gw["attach_errors"][target] = entry
             gw["attach_error_seen"][target] = time.monotonic()
+            gw["attach_error_generation"][target] = generation
             if previous is None or previous["message"] != message:
                 self._queue_log_locked(gw, entry)
             self._log_throttled(("gateway_error", target), self.logger.error, message)
@@ -1111,42 +1107,60 @@ class UDMIHandler:
             gw["config_dirty"] = True
             self._refresh_dirty_flag_locked(gw)
 
+    def _drop_attach_error_locked(self, gw: dict, target: str):
+        gw["attach_errors"].pop(target, None)
+        gw["attach_error_seen"].pop(target, None)
+        gw["attach_error_generation"].pop(target, None)
+
+    def _update_attach_status_locked(self, gw: dict):
+        remaining = list(gw["attach_errors"].values())
+        gw["attach_status"] = remaining[-1] if remaining else None
+        self._refresh_dirty_flag_locked(gw)
+
     def _note_proxy_config_received_locked(self, device_id: str):
         gw = self.devices_by_id.get(self.gateway_id)
         if gw is None or device_id not in gw["attach_errors"]:
             return
-        del gw["attach_errors"][device_id]
-        gw["attach_error_seen"].pop(device_id, None)
-        remaining = list(gw["attach_errors"].values())
-        gw["attach_status"] = remaining[-1] if remaining else None
-        self._refresh_dirty_flag_locked(gw)
+        self._drop_attach_error_locked(gw, device_id)
+        self._update_attach_status_locked(gw)
 
-    def clear_attach_errors(self):
-        """New MQTT session: attachments are redone, so earlier cloud errors no longer apply."""
+    def clear_attach_errors(self, before_generation=None):
+        """New MQTT session: proxies are re-attached, so errors from older sessions no longer apply.
+
+        Errors tagged with `before_generation` or newer (answers to the new session) are kept.
+        """
         with self._lock:
             gw = self.devices_by_id.get(self.gateway_id)
             if gw is None or not gw["attach_errors"]:
                 return
-            gw["attach_errors"].clear()
-            gw["attach_error_seen"].clear()
-            gw["attach_status"] = None
-            self._refresh_dirty_flag_locked(gw)
+            for target in list(gw["attach_errors"]):
+                generation = gw["attach_error_generation"].get(target)
+                if before_generation is None or generation is None or generation < before_generation:
+                    self._drop_attach_error_locked(gw, target)
+            self._update_attach_status_locked(gw)
 
     def _expire_attach_errors_locked(self):
-        """Cloud errors that have not recurred for ATTACH_ERROR_TTL_SEC are cleared."""
+        """Errors for targets that are not configured proxies clear if they stop recurring.
+
+        Errors for configured proxies stay until the proxy receives its config (proof of attach),
+        is removed from proxy_ids, or a new session starts: the cloud reports them only once per
+        attach attempt.
+        """
         gw = self.devices_by_id.get(self.gateway_id)
         if gw is None or not gw["attach_errors"]:
             return
         now = time.monotonic()
-        expired = [d for d, seen in gw["attach_error_seen"].items() if now - seen > ATTACH_ERROR_TTL_SEC]
+        proxies = set(gw.get("configured_proxy_ids") or [])
+        expired = [
+            target
+            for target, seen in gw["attach_error_seen"].items()
+            if target not in proxies and now - seen > ATTACH_ERROR_TTL_SEC
+        ]
         if not expired:
             return
-        for device_id in expired:
-            gw["attach_errors"].pop(device_id, None)
-            gw["attach_error_seen"].pop(device_id, None)
-        remaining = list(gw["attach_errors"].values())
-        gw["attach_status"] = remaining[-1] if remaining else None
-        self._refresh_dirty_flag_locked(gw)
+        for target in expired:
+            self._drop_attach_error_locked(gw, target)
+        self._update_attach_status_locked(gw)
 
     # ------------------------------------------------------------------ config
 
@@ -1305,12 +1319,14 @@ class UDMIHandler:
                 if isinstance(proxy_ids, list):
                     dev["configured_proxy_ids"] = [str(p) for p in proxy_ids]
                     for stale in [d for d in dev["attach_errors"] if d not in dev["configured_proxy_ids"]]:
-                        del dev["attach_errors"][stale]
+                        dev["attach_errors"].pop(stale, None)
                         dev["attach_error_seen"].pop(stale, None)
+                        dev["attach_error_generation"].pop(stale, None)
                     remaining = list(dev["attach_errors"].values())
                     dev["attach_status"] = remaining[-1] if remaining else None
                 known_proxies = {d for d, rec in self.devices_by_id.items() if not rec["is_gateway"]}
                 unknown = sorted(set(dev["configured_proxy_ids"]) - known_proxies)
+                previous = dev.get("proxy_config_status")
                 dev["proxy_config_status"] = (
                     self.make_entry(
                         CATEGORY_GATEWAY_SETUP_ATTACH,
@@ -1321,6 +1337,9 @@ class UDMIHandler:
                     if unknown
                     else None
                 )
+                new = dev["proxy_config_status"]
+                if new is not None and (previous is None or previous["message"] != new["message"]):
+                    self._queue_log_locked(dev, new)  # gateway.md: attach errors also as a logentry
             else:
                 target = gw_cfg.get("target")
                 if isinstance(target, dict) and target:
@@ -1345,7 +1364,8 @@ class UDMIHandler:
                 dev["next_pointset_mono"] = now_mono + min(1.0, new_interval)
 
             new_cfg_points = {}
-            if isinstance(ps_cfg.get("points"), dict) and ps_cfg["points"]:
+            if isinstance(ps_cfg.get("points"), dict):
+                # A `points` object is authoritative, even when empty (no points configured).
                 for pt_name, pt_spec in ps_cfg["points"].items():
                     new_cfg_points[str(pt_name)] = dict(pt_spec) if isinstance(pt_spec, dict) else {}
             else:
