@@ -1,5 +1,6 @@
 import os
-import sys
+
+from google_iot_core_gateway.errors import GatewayConfigError
 
 
 # import datetime
@@ -13,11 +14,14 @@ import sys
 
 def get_google_root_ca(resources_path, custom_ca_cert=None):
     """
-    Get Google IoT Core root cert or custom CA certificate path.
+    Get the CA bundle used to verify the MQTT bridge.
+    Returns:
+        Tuple of (ca_cert_path, is_explicit): `is_explicit` is True for a configured/custom CA
+        (which must exist) and False for the bundled default `resources/roots.pem`.
     """
     if custom_ca_cert:
-        return custom_ca_cert
-    return os.path.join(resources_path, "roots.pem")
+        return custom_ca_cert, True
+    return os.path.join(resources_path, "roots.pem"), False
 
 
 def get_gateway_private_key(logger, udmi_site_model_path, gateway_id, required=True):
@@ -27,9 +31,9 @@ def get_gateway_private_key(logger, udmi_site_model_path, gateway_id, required=T
         logger: Logger
         udmi_site_model_path: UDMI Site Model path
         gateway_id: ID of Google Iot Core gateway device
-        required: Exit if private key is missing
+        required: Raise GatewayConfigError if the private key is missing
     Returns:
-        Tuple of (private_key_path, algorithm, pkcs8_key_path)
+        Tuple of (private_key_path, algorithm); private_key_path is None if not required and missing
     """
     device_dir = os.path.join(udmi_site_model_path, "devices", gateway_id)
 
@@ -56,9 +60,9 @@ def get_gateway_private_key(logger, udmi_site_model_path, gateway_id, required=T
         logger.warning(f"No private key found at '{device_dir}'; continuing without JWT key.")
         return None, "RS256"
 
-    logger.error(
-        f"Private key not found! Please make sure that either 'rsa_private.pem' or 'ec_private.pem' file is at '{device_dir}' path")
-    sys.exit(1)
+    raise GatewayConfigError(
+        f"Private key not found: expected 'rsa_private.pem' or 'ec_private.pem' in '{device_dir}'"
+    )
 
 # def _generate_rsa_key():
 #     key = rsa.generate_private_key(

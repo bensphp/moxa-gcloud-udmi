@@ -1,3 +1,5 @@
+# This software is licensed under GNU GENERAL PUBLIC LICENSE Version 3, 29 June 2007
+
 import argparse
 import json
 import os
@@ -5,7 +7,10 @@ import queue
 import time
 from queue import Empty
 
+import paho.mqtt.client as mqtt
+
 from google_iot_core_gateway import ROOT_DIR
+from google_iot_core_gateway.errors import EXIT_FATAL, EXIT_OK, EXIT_RESTART, GatewayConfigError
 from google_iot_core_gateway.gcp_publisher import GoogleIoTCoreMQTTPublisher
 from google_iot_core_gateway.internal_broker_subscriber.internal_broker_subscriber import (
     MosquittoMQTTSubscriber,
@@ -18,6 +23,19 @@ from google_iot_core_gateway.utils.certificates_handler import (
 )
 from google_iot_core_gateway.utils.config_handler import ConfigHandler
 from google_iot_core_gateway.utils.log import setup_logger
+from google_iot_core_gateway.utils.persistent_store import PersistentStore
+
+SUMMARY_INTERVAL_SEC = 600.0
+RESTART_FLUSH_TIMEOUT_SEC = 3.0
+_LOG_THROTTLE = {}
+
+
+def _log_throttled(key, level_fn, message, interval_sec=300.0):
+    now = time.monotonic()
+    last = _LOG_THROTTLE.get(key)
+    if last is None or now - last >= interval_sec:
+        _LOG_THROTTLE[key] = now
+        level_fn(message)
 
 
 def get_google_cloud_cmd_line_parser():
@@ -112,7 +130,7 @@ def get_google_cloud_cmd_line_parser():
         dest="site_details__serial_no",
         type=str,
         metavar="SERIAL_NO",
-        help="Gateway device serial number reported in UDMI state.system.serial_no",
+        help="Gateway serial number, used when the hardware does not expose one",
     )
 
     group = parser.add_argument_group("Environment settings")
@@ -129,6 +147,15 @@ def get_google_cloud_cmd_line_parser():
         type=str,
         metavar="PATH",
         help="Overwrite resources path",
+    )
+    group.add_argument(
+        "-state-dir",
+        "--state-dir",
+        dest="state_dir",
+        type=str,
+        metavar="PATH",
+        help="Directory for persistent data (restart counter). Default: systemd StateDirectory, "
+        "/var/lib/moxa-gcloud-udmi or ~/.local/state/moxa-gcloud-udmi",
     )
 
     return parser
@@ -163,8 +190,12 @@ def parse_command_line_args(args=None, parents=None):
     return parsed_args
 
 
-def _resolve_local_mqtt_tls_files(config):
-    """Auto-discover UDMI site model reflector/ca.crt and device client cert when using iot_provider=mqtt."""
+def _resolve_tls_files(config):
+    """Return (ca_cert, ca_is_explicit, client_cert, client_key) for the upstream connection.
+
+    For local UDMI brokers (`iot_provider` mqtt/local) the site model's `reflector/ca.crt` and the
+    gateway's `rsa_private.crt`/`.pem` client certificate are used when present.
+    """
     ca_cert = config.google_cloud__ca_cert
     client_cert = config.google_cloud__client_cert
     client_key = config.google_cloud__client_key
@@ -190,11 +221,12 @@ def _resolve_local_mqtt_tls_files(config):
                     client_key = cand
                     break
 
-    return get_google_root_ca(config.resources_path, custom_ca_cert=ca_cert), client_cert, client_key
+    ca_path, ca_is_explicit = get_google_root_ca(config.resources_path, custom_ca_cert=ca_cert)
+    return ca_path, ca_is_explicit, client_cert, client_key
 
 
-def _get_google_iot_core_publisher(logger, config):
-    """Set up Google IoT Core / ClearBlade / Local UDMI MQTT publisher client."""
+def _get_google_iot_core_publisher(logger, config, autostart=False):
+    """Set up the ClearBlade / Cloud IoT Core / local UDMI MQTT publisher client."""
     key_required = config.google_cloud__iot_provider not in ("mqtt", "local")
     private_key_file_path, encryption_algorithm = get_gateway_private_key(
         logger,
@@ -202,7 +234,7 @@ def _get_google_iot_core_publisher(logger, config):
         config.site_details__gateway_id,
         required=key_required,
     )
-    ca_cert, client_cert, client_key = _resolve_local_mqtt_tls_files(config)
+    ca_cert, ca_is_explicit, client_cert, client_key = _resolve_tls_files(config)
 
     return GoogleIoTCoreMQTTPublisher(
         logger,
@@ -215,6 +247,7 @@ def _get_google_iot_core_publisher(logger, config):
         mqtt_bridge_port=config.google_cloud__mqtt_bridge_port,
         private_key_file=private_key_file_path,
         ca_cert=ca_cert,
+        ca_cert_required=ca_is_explicit,
         jwt_signing_algorithm=encryption_algorithm,
         iot_provider=config.google_cloud__iot_provider,
         enable_tls=config.google_cloud__enable_tls,
@@ -222,27 +255,32 @@ def _get_google_iot_core_publisher(logger, config):
         client_key=client_key,
         mqtt_username=config.google_cloud__mqtt_username,
         mqtt_password=config.google_cloud__mqtt_password,
+        jwt_expires_minutes=config.google_cloud__jwt_expires_minutes,
+        autostart=autostart,
     )
 
 
-def _get_udmi_handler(logger, config):
+def _get_udmi_handler(logger, config, restart_count=1):
     """Initialize UDMIHandler with both the gateway device and all proxied Modbus devices."""
     udmi_handler = UDMIHandler(
         logger,
         config.resources_path,
         config.udmi_site_model_path,
         default_sample_rate_sec=config.google_cloud__sample_rate_set,
+        stale_timeout_sec=config.modbus__stale_timeout_sec,
     )
 
     for device_id in list(config.site_details__devices.keys()):
         details = config.site_details__devices[device_id]
-        modbus_slave_id = details["modbus_slave_id"]
-        device_type = details["type"]
-        proxy_serial = details.get("serial_no")
         device_added = udmi_handler.add_device_to_dict(
-            modbus_slave_id, device_id, device_type, serial_no=proxy_serial
+            details["modbus_slave_id"],
+            device_id,
+            details["type"],
+            serial_no=details.get("serial_no"),
+            port=details.get("port"),
         )
         if not device_added:
+            logger.error(f"Proxy device '{device_id}' could not be registered and is skipped")
             del config.site_details__devices[device_id]
 
     udmi_handler.register_gateway(
@@ -250,32 +288,25 @@ def _get_udmi_handler(logger, config):
         proxy_ids=list(config.site_details__devices.keys()),
         serial_no=config.site_details__serial_no,
         localnet_config=config.site_details__localnet,
+        restart_count=restart_count,
+        hardware=config.site_details__hardware,
     )
-
     return udmi_handler
 
 
-def prepare_google_cloud_environment(logger, config):
-    """Set up UDMI handler and MQTT publisher client."""
-    udmi_handler = _get_udmi_handler(logger, config)
+def prepare_google_cloud_environment(logger, config, restart_count=1):
+    """Set up UDMI handler and MQTT publisher client (not yet connected)."""
+    udmi_handler = _get_udmi_handler(logger, config, restart_count=restart_count)
     google_iot_core_publisher = _get_google_iot_core_publisher(logger, config)
     return google_iot_core_publisher, udmi_handler
 
 
-def _build_slave_to_type_map(udmi_handler: UDMIHandler) -> dict:
-    return {
-        int(slave_id): dev["device_type"]
-        for slave_id, dev in udmi_handler.devices.items()
-        if "device_type" in dev
-    }
-
-
-def process_payloads(logger, google_iot_core_queue, udmi_handler, max_batch=64):
+def process_payloads(logger, google_iot_core_queue, udmi_handler, max_batch=64, strict_crc=True):
     """
-    Drain up to `max_batch` Modbus RTU payloads from the internal broker queue
-    and update proxied device properties in `udmi_handler`.
+    Drain up to `max_batch` MXcloudgate Modbus RTU messages from the internal broker queue and
+    apply them to the proxied devices.
     """
-    slave_to_type = _build_slave_to_type_map(udmi_handler)
+    slave_to_type = udmi_handler.get_meter_types()
     processed = 0
 
     while processed < max_batch:
@@ -283,51 +314,40 @@ def process_payloads(logger, google_iot_core_queue, udmi_handler, max_batch=64):
             raw_item = google_iot_core_queue.get_nowait()
         except Empty:
             break
-
         processed += 1
+
         try:
             frame_msg = json.loads(raw_item)
             rtu_request = bytes.fromhex(frame_msg["rtu_request"])
             rtu_response = bytes.fromhex(frame_msg["rtu_response"])
-
             decoded_json = modbus_to_json(
                 rtu_request,
                 rtu_response,
                 slave_to_type=slave_to_type,
-                dbo_maps=udmi_handler._modbus_dbo_map,
+                dbo_maps=udmi_handler.dbo_maps,
+                strict_crc=strict_crc,
             )
-        except Exception as ex:
-            logger.error(f"Exception decoding internal Modbus queue item: {ex}")
-            continue
-
-        if not decoded_json:
-            continue
-
-        payload = json.loads(decoded_json)
-        modbus_slave_id = str(payload["slave_id"])
-        if modbus_slave_id not in udmi_handler.devices:
-            logger.debug(
-                f"Modbus slave '{modbus_slave_id}' is not configured in site_details; ignoring."
+            if not decoded_json:
+                continue
+            payload = json.loads(decoded_json)
+            if payload.get("fc") not in (3, 4):
+                continue
+            udmi_handler.record_modbus_payload(payload)
+        except (ValueError, KeyError, TypeError, AttributeError) as ex:
+            _log_throttled(
+                ("bad_frame", type(ex).__name__),
+                logger.warning,
+                f"Ignoring malformed MXcloudgate message ({type(ex).__name__}: {ex})",
             )
-            continue
-
-        error = payload.get("error")
-        if error is not None:
-            udmi_handler.set_modbus_poll_error(modbus_slave_id, error)
-            continue
-
-        udmi_handler.set_modbus_poll_error(modbus_slave_id, None)
-        device_type = udmi_handler.devices[modbus_slave_id]["device_type"]
-        function_code = payload.get("fc")
-        data = payload.get("data") or {}
-
-        if function_code in (3, 4) and isinstance(data, dict):
-            for registry, value in data.items():
-                udmi_handler.update_device_properties(
-                    modbus_slave_id, device_type, registry, value
-                )
 
     return processed
+
+
+def _handle_downlink_config(logger, google_iot_core_publisher, udmi_handler, device_id, raw_payload):
+    logger.debug(f"Processing downlink UDMI config for '{device_id}'")
+    udmi_handler.handle_config(device_id, raw_payload)
+    if device_id == udmi_handler.gateway_id:
+        google_iot_core_publisher.sync_proxy_devices(udmi_handler.get_configured_proxy_ids())
 
 
 def process_downlink_configs(logger, google_iot_core_publisher, udmi_handler):
@@ -338,64 +358,160 @@ def process_downlink_configs(logger, google_iot_core_publisher, udmi_handler):
             device_id, raw_payload = google_iot_core_publisher.config_queue.get_nowait()
         except Empty:
             break
-
         processed += 1
-        logger.info(f"Processing downlink UDMI config for '{device_id}'")
-        udmi_handler.handle_config(device_id, raw_payload)
-
-        # If gateway config updated proxy_ids, synchronize MQTT proxy subscriptions/attachments
-        if device_id == udmi_handler.gateway_id:
-            gw_dev = udmi_handler.devices_by_id.get(device_id) or {}
-            google_iot_core_publisher.sync_proxy_devices(gw_dev.get("configured_proxy_ids"))
-
+        _handle_downlink_config(logger, google_iot_core_publisher, udmi_handler, device_id, raw_payload)
     return processed
 
 
-def publish_due_udmi_messages(logger, google_iot_core_publisher, udmi_handler):
+def process_gateway_errors(google_iot_core_publisher, udmi_handler):
+    """Surface cloud `errors` topic messages (e.g. failed proxy attach) in the gateway state."""
+    errors = google_iot_core_publisher.drain_gateway_errors()
+    for device_id, payload in errors:
+        udmi_handler.record_gateway_error(device_id, payload)
+    return len(errors)
+
+
+def _publish(logger, publisher, stats, device_id, payload, topic):
+    info = publisher.publish(device_id, payload, topic=topic)
+    rc = getattr(info, "rc", mqtt.MQTT_ERR_SUCCESS)
+    if rc == mqtt.MQTT_ERR_SUCCESS:
+        if stats is not None:
+            stats[topic] = stats.get(topic, 0) + 1
+    else:
+        _log_throttled(
+            ("publish_rc", topic, rc),
+            logger.warning,
+            f"MQTT client did not accept '{topic}' for {device_id}: {mqtt.error_string(rc)}",
+        )
+    return info, rc
+
+
+def publish_due_udmi_messages(logger, google_iot_core_publisher, udmi_handler, stats=None):
     """
-    Publish due `events/system`, `events/discovery`, dirty `state`, and scheduled
+    Publish due `events/system`, `events/discovery`, changed `state`, and scheduled
     `events/pointset` messages for the gateway and all active proxied devices.
 
     `events/system` and `events/discovery` are flushed BEFORE `state` so config logs and
-    self-enumeration payloads arrive at the UDMI sequencer ahead of state synchronization.
+    self-enumeration payloads arrive ahead of the state update. Returns the list of
+    MQTTMessageInfo objects for the published messages.
     """
+    infos = []
     now_mono = time.monotonic()
     for device_id in udmi_handler.get_active_device_ids():
-        # 1. System events (logs & metrics)
         sys_event_payload = udmi_handler.pop_due_system_event_payload(device_id, now_mono=now_mono)
         if sys_event_payload is not None:
-            logger.info(f"Publishing 'events/system' for device '{device_id}'")
-            google_iot_core_publisher.publish(device_id, sys_event_payload, topic="events/system")
-
-        # 2. Self-enumeration discovery events
-        for disc_payload in udmi_handler.pop_due_discovery_events(device_id):
-            logger.info(f"Publishing 'events/discovery' for device '{device_id}'")
-            google_iot_core_publisher.publish(
-                device_id, disc_payload, topic="events/discovery"
+            info, _rc = _publish(
+                logger, google_iot_core_publisher, stats, device_id, sys_event_payload, "events/system"
             )
+            infos.append(info)
 
-        # 3. Device state (only when dirty and past 2s throttle)
+        for disc_payload in udmi_handler.pop_due_discovery_events(device_id):
+            info, _rc = _publish(
+                logger, google_iot_core_publisher, stats, device_id, disc_payload, "events/discovery"
+            )
+            infos.append(info)
+
         state_payload = udmi_handler.pop_due_state_payload(device_id, now_mono=now_mono)
         if state_payload is not None:
-            logger.info(f"Publishing 'state' for device '{device_id}'")
-            google_iot_core_publisher.publish(device_id, state_payload, topic="state")
+            info, rc = _publish(
+                logger, google_iot_core_publisher, stats, device_id, state_payload, "state"
+            )
+            infos.append(info)
+            if rc == mqtt.MQTT_ERR_SUCCESS:
+                logger.info(f"Published state for '{device_id}'")
+            else:
+                udmi_handler.state_publish_failed(device_id)
 
-        # 4. Pointset telemetry events (on per-device sample_rate_sec / sample_limit_sec schedule)
         pointset_payload = udmi_handler.pop_due_pointset_event_payload(device_id, now_mono=now_mono)
         if pointset_payload is not None:
-            logger.info(f"Publishing 'events/pointset' for device '{device_id}'")
-            google_iot_core_publisher.publish(
-                device_id, pointset_payload, topic="events/pointset"
+            info, _rc = _publish(
+                logger, google_iot_core_publisher, stats, device_id, pointset_payload, "events/pointset"
             )
+            infos.append(info)
+    return infos
+
+
+def _wait_for_delivery(infos, timeout_sec):
+    deadline = time.monotonic() + timeout_sec
+    for info in infos:
+        while time.monotonic() < deadline:
+            try:
+                if info.is_published():
+                    break
+            except (RuntimeError, ValueError):
+                break
+            time.sleep(0.05)
+
+
+def run_gateway_loop(logger, config, google_iot_core_publisher, udmi_handler, google_iot_core_queue, stop_event=None):
+    """Main loop. Returns EXIT_OK on shutdown request or EXIT_RESTART on a UDMI restart request."""
+    strict_crc = config.modbus__crc_check == "strict"
+    last_generation = google_iot_core_publisher.connection_generation
+    stats = {}
+    next_summary = time.monotonic() + SUMMARY_INTERVAL_SEC
+
+    while stop_event is None or not stop_event.is_set():
+        # Wait up to 100ms for an incoming downlink config so config updates react sub-second
+        try:
+            device_id, raw_payload = google_iot_core_publisher.config_queue.get(timeout=0.1)
+            _handle_downlink_config(logger, google_iot_core_publisher, udmi_handler, device_id, raw_payload)
+        except Empty:
+            pass
+
+        process_downlink_configs(logger, google_iot_core_publisher, udmi_handler)
+        process_gateway_errors(google_iot_core_publisher, udmi_handler)
+        process_payloads(logger, google_iot_core_queue, udmi_handler, strict_crc=strict_crc)
+        udmi_handler.tick()
+        google_iot_core_publisher.maintain()
+
+        generation = google_iot_core_publisher.connection_generation
+        if generation != last_generation:
+            # New MQTT session: anything sent on the old one may be lost, so send state again.
+            last_generation = generation
+            udmi_handler.force_republish_all()
+
+        if google_iot_core_publisher.is_connected():
+            infos = publish_due_udmi_messages(
+                logger, google_iot_core_publisher, udmi_handler, stats=stats
+            )
+        else:
+            infos = []
+
+        if udmi_handler.restart_requested:
+            if google_iot_core_publisher.is_connected():
+                infos += publish_due_udmi_messages(
+                    logger, google_iot_core_publisher, udmi_handler, stats=stats
+                )
+            _wait_for_delivery(infos, RESTART_FLUSH_TIMEOUT_SEC)
+            logger.warning("Restart requested via UDMI system.operation.mode; exiting for restart")
+            return EXIT_RESTART
+
+        if time.monotonic() >= next_summary:
+            next_summary = time.monotonic() + SUMMARY_INTERVAL_SEC
+            logger.info(
+                f"Last {int(SUMMARY_INTERVAL_SEC)} s: connected={google_iot_core_publisher.is_connected()} "
+                f"published={dict(sorted(stats.items()))}"
+            )
+            stats.clear()
+    return EXIT_OK
 
 
 def start_google_iot_core_gateway(logger, args, root_dir=None, stop_event=None):
     """
-    Main loop establishing connections to the internal MXcloudgate broker and upstream
-    MQTT bridge, processing Modbus telemetry and downlink UDMI configs, and publishing
-    UDMI 1.5 state and event messages.
+    Run the gateway: connect to the internal MXcloudgate broker and the upstream MQTT bridge,
+    process Modbus telemetry and downlink UDMI configs, and publish UDMI messages.
+
+    Returns a process exit code (EXIT_OK, EXIT_FATAL or EXIT_RESTART).
     """
-    config = ConfigHandler(logger, args, root_dir or ROOT_DIR)
+    try:
+        config = ConfigHandler(logger, args, root_dir or ROOT_DIR)
+        restart_count = PersistentStore(logger, config.state_dir).increment_restart_count()
+        google_iot_core_publisher, udmi_handler = prepare_google_cloud_environment(
+            logger, config, restart_count=restart_count
+        )
+    except GatewayConfigError as exc:
+        logger.error(f"Fatal configuration error: {exc}")
+        return EXIT_FATAL
 
     google_iot_core_queue = queue.Queue(maxsize=500)
     int_broker_subscriber = MosquittoMQTTSubscriber(
@@ -410,32 +526,17 @@ def start_google_iot_core_gateway(logger, args, root_dir=None, stop_event=None):
         config.internal_broker__enable_tls,
     )
     int_broker_subscriber.run()
-
-    google_iot_core_publisher, udmi_handler = prepare_google_cloud_environment(logger, config)
+    google_iot_core_publisher.start()
 
     try:
-        while stop_event is None or not stop_event.is_set():
-            # Wait up to 100ms for an incoming downlink config so config updates react sub-second
-            try:
-                first_cfg = google_iot_core_publisher.config_queue.get(timeout=0.1)
-                device_id, raw_payload = first_cfg
-                logger.info(f"Processing downlink UDMI config for '{device_id}'")
-                udmi_handler.handle_config(device_id, raw_payload)
-                if device_id == udmi_handler.gateway_id:
-                    gw_dev = udmi_handler.devices_by_id.get(device_id) or {}
-                    google_iot_core_publisher.sync_proxy_devices(
-                        gw_dev.get("configured_proxy_ids")
-                    )
-            except Empty:
-                pass
-
-            process_downlink_configs(logger, google_iot_core_publisher, udmi_handler)
-            process_payloads(logger, google_iot_core_queue, udmi_handler)
-
-            if not google_iot_core_publisher.is_connection_open():
-                continue
-
-            publish_due_udmi_messages(logger, google_iot_core_publisher, udmi_handler)
+        return run_gateway_loop(
+            logger,
+            config,
+            google_iot_core_publisher,
+            udmi_handler,
+            google_iot_core_queue,
+            stop_event=stop_event,
+        )
     finally:
         int_broker_subscriber.stop()
         google_iot_core_publisher.close()
@@ -448,4 +549,18 @@ def start_standalone_google_iot_core_gateway(assigned_args=None, logger=None, st
     )
     if not logger:
         logger = setup_logger()
-    start_google_iot_core_gateway(logger, args, stop_event=stop_event)
+    return start_google_iot_core_gateway(logger, args, stop_event=stop_event)
+
+
+__all__ = [
+    "EXIT_FATAL",
+    "EXIT_OK",
+    "EXIT_RESTART",
+    "get_google_cloud_cmd_line_parser",
+    "process_downlink_configs",
+    "process_gateway_errors",
+    "process_payloads",
+    "publish_due_udmi_messages",
+    "run_gateway_loop",
+    "start_google_iot_core_gateway",
+]

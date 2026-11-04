@@ -1,6 +1,10 @@
 import datetime
+
 import jwt
 from cryptography.hazmat.primitives import serialization
+
+DEFAULT_JWT_EXPIRES_MINUTES = 60
+MAX_JWT_EXPIRES_MINUTES = 24 * 60  # ClearBlade / Cloud IoT Core maximum token lifetime
 
 
 def _load_private_key(private_key_file):
@@ -12,7 +16,7 @@ def _load_private_key(private_key_file):
     return serialization.load_der_private_key(raw_bytes, password=None)
 
 
-def create_jwt(logger, project_id, private_key_file, algorithm):
+def create_jwt(logger, project_id, private_key_file, algorithm, expires_minutes=DEFAULT_JWT_EXPIRES_MINUTES):
     """
     Creates a JWT (https://jwt.io) to establish an MQTT connection.
     Args:
@@ -21,16 +25,18 @@ def create_jwt(logger, project_id, private_key_file, algorithm):
         private_key_file: A path to a file containing either an RSA256 or
              ES256 private key (PEM or PKCS8 DER).
         algorithm: The encryption algorithm to use. Either 'RS256' or 'ES256'
+        expires_minutes: Token lifetime in minutes (1 .. 1440)
     Returns:
         A tuple of (jwt_string, expiration_datetime_utc).
     Raises:
         ValueError: If the private_key_file does not contain a known key.
     """
+    expires_minutes = max(1, min(int(expires_minutes), MAX_JWT_EXPIRES_MINUTES))
 
     # The time that the token was issued at
     jwt_iat = datetime.datetime.now(datetime.timezone.utc)
     # The time the token expires.
-    jwt_exp = jwt_iat + datetime.timedelta(minutes=20)
+    jwt_exp = jwt_iat + datetime.timedelta(minutes=expires_minutes)
 
     token = {
         "iat": jwt_iat,

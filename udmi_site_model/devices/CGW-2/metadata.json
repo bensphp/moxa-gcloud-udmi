@@ -18,7 +18,7 @@
       "model": "UC8220"
     },
     "software": {
-      "firmware": "4.2.0"
+      "firmware": "4.3.0"
     },
     "serial_no": "CGW2-UC8220-001"
   },
@@ -32,9 +32,6 @@
   "cloud": {
     "auth_type": "RS256"
   },
-  "pointset": {
-    "points": {}
-  },
   "localnet": {
     "families": {
       "ether": {
@@ -42,17 +39,11 @@
       },
       "ipv4": {
         "addr": "192.168.4.2"
-      },
-      "ipv6": {
-        "addr": "fd00::c6a2:2"
       }
     }
   },
   "features": {
     "system": {
-      "stage": "stable"
-    },
-    "pointset": {
       "stage": "stable"
     },
     "gateway": {
@@ -68,9 +59,6 @@
       "stage": "beta"
     },
     "enumeration.features": {
-      "stage": "beta"
-    },
-    "enumeration.pointset": {
       "stage": "beta"
     }
   }

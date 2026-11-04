@@ -6,8 +6,15 @@
 """
 Synthetic Moxa MXcloudgate Modbus RTU publisher for local testing and UDMI Sequencer validation.
 
-Publishes CRC-16 valid Modbus FC03 request/response pairs onto the `MXcloudgate` MQTT topic
-for configured Modbus slave IDs (default: 1, 2, 3 -> EM-11, EM-12, EM-13).
+Publishes CRC-16 valid Modbus FC03 request/response pairs onto the `MXcloudgate` MQTT topic in
+the MXcloudgate JSON format ({"rtu_request": "<hex>", "rtu_response": "<hex>"}). Frames are built
+from the meter register maps in resources/modbus_dbo_maps, including the identity registers
+(serial number, firmware, manufacturer, model), so every point the gateway knows gets a value.
+
+Fault injection for testing:
+  --na 1:3028          meter 1 reports register 3028 as "not available" (NaN / sentinel)
+  --fail-block 2:3000  meter 2 answers the request block containing register 3000 with
+                       Modbus exception 0x02 (illegal data address)
 """
 
 import argparse
@@ -26,93 +33,166 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from google_iot_core_gateway.modbus_gw.modbus_to_json import append_modbus_crc16
+from google_iot_core_gateway.modbus_gw.modbus_to_json import append_modbus_crc16  # noqa: E402
 
+MAPS_DIR = REPO_ROOT / "resources" / "modbus_dbo_maps"
+MAX_BLOCK_REGISTERS = 120
+MAX_BLOCK_GAP = 16
 
-# Realistic 3-phase 230V/400V 50Hz Schneider PowerLogic register values (1-based addresses)
-FLOAT32_BASE_VALUES = {
-    3000: 12.4,   # line1_current_sensor
-    3002: 11.9,   # line2_current_sensor
-    3004: 12.1,   # line3_current_sensor
-    3006: 0.4,    # neutral_current_sensor
-    3010: 12.13,  # average_line_current_sensor
-    3020: 400.2,  # line1_line2_voltage_sensor
-    3022: 399.8,  # line2_line3_voltage_sensor
-    3024: 400.5,  # line1_line3_voltage_sensor
-    3026: 400.17, # average_line_line_voltage_sensor
-    3028: 231.1,  # line1_neutral_voltage_sensor
-    3030: 230.8,  # line2_neutral_voltage_sensor
-    3032: 231.2,  # line3_neutral_voltage_sensor
-    3036: 231.03, # average_line_neutral_voltage_sensor
-    3054: 2.72,   # line1_neutral_power_sensor
-    3056: 2.61,   # line2_neutral_power_sensor
-    3058: 2.66,   # line3_neutral_power_sensor
-    3060: 7.99,   # total_power_sensor
-    3062: 0.45,   # line1_neutral_reactive_power_sensor
-    3064: 0.42,   # line2_neutral_reactive_power_sensor
-    3066: 0.44,   # line3_neutral_reactive_power_sensor
-    3068: 1.31,   # total_reactive_power_sensor
-    3070: 2.76,   # line1_neutral_apparent_power_sensor
-    3072: 2.64,   # line2_neutral_apparent_power_sensor
-    3074: 2.70,   # line3_neutral_apparent_power_sensor
-    3076: 8.10,   # total_apparent_power_sensor
-    3078: 0.985,  # line1_neutral_powerfactor_sensor
-    3080: 0.988,  # line2_neutral_powerfactor_sensor
-    3082: 0.986,  # line3_neutral_powerfactor_sensor
-    3084: 0.986,  # total_powerfactor_sensor
+# Identity reported by each simulated meter (the site model must match what the meter reports).
+DEFAULT_IDENTITIES = {
+    1: {
+        "type": "PM5561",
+        "serial_no": 52110011,
+        "firmware_version": 1103,
+        "manufacturer_name": "Schneider Electric",
+        "model_name": "PM5561",
+        "product_name": "PowerLogic PM5561",
+    },
+    2: {
+        "type": "PM5111",
+        "serial_no": 51110012,
+        "firmware_version": 1203,
+        "manufacturer_name": "Schneider Electric",
+        "model_name": "PM5111",
+        "product_name": "PowerLogic PM5111",
+    },
+    3: {
+        "type": "PM8240",
+        "serial_no": "PM8240-0013",
+        "firmware_version": "2.1.0",
+        "manufacturer_name": "Schneider Electric",
+        "model_name": "PM8240",
+        "product_name": "PowerLogic PM8240",
+    },
+}
+
+_INT_NA = {
+    "int16u": 0xFFFF,
+    "int16": -0x8000,
+    "int32u": 0xFFFFFFFF,
+    "int32": -0x80000000,
+    "int64": -0x8000000000000000,
+    "int64u": 0xFFFFFFFFFFFFFFFF,
+}
+_STRUCT = {
+    "float32": ">f",
+    "float64": ">d",
+    "int16u": ">H",
+    "int16": ">h",
+    "int32u": ">I",
+    "int32": ">i",
+    "int64": ">q",
+    "int64u": ">Q",
 }
 
 
-def build_slave_frames(slave_id: int, tick: int) -> list:
-    """Build 3 FC03 RTU request/response pairs covering all 32 meter points."""
-    frames = []
+def load_meter_map(meter_type: str) -> dict:
+    with open(MAPS_DIR / f"{meter_type}.json", "r", encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def plausible_value(name: str, fmt: str, slave_id: int, tick: int):
+    """Plausible 3-phase 230/400 V 50 Hz value for a DBO point name."""
     jitter = (slave_id * 0.1) + random.uniform(-0.05, 0.05)
+    lname = name.lower()
+    if "energy" in lname:
+        wh = 125000 + slave_id * 1000 + tick * 5
+        return wh if fmt.startswith("int") else wh / 1000.0
+    if "harmonic" in lname:
+        return 2.5 + jitter
+    if "powerfactor" in lname:
+        return 0.985
+    if "frequency" in lname:
+        return 50.0 + random.uniform(-0.02, 0.02)
+    if "voltage" in lname:
+        return (231.0 if "neutral" in lname else 400.2) + jitter
+    if "current" in lname:
+        return (0.4 if lname.startswith("neutral") else 12.1) + jitter
+    if "reactive_power" in lname:
+        return 0.45 + jitter
+    if "apparent_power" in lname:
+        return 2.7 + jitter
+    if "power" in lname:
+        return 2.6 + jitter
+    return 1.0 + jitter
 
-    # Block 1: PDU 2999, qty 86 (1-based registers 3000..3085)
-    start1, qty1 = 2999, 86
-    buf1 = bytearray(qty1 * 2)
-    for reg_1based, base_val in FLOAT32_BASE_VALUES.items():
-        offset = (reg_1based - 1 - start1) * 2
-        val = base_val if reg_1based >= 3078 else (base_val + jitter)
-        buf1[offset:offset + 4] = struct.pack(">f", val)
-    req1 = append_modbus_crc16(struct.pack(">BBHH", slave_id, 3, start1, qty1))
-    resp1 = append_modbus_crc16(struct.pack(">BBB", slave_id, 3, qty1 * 2) + bytes(buf1))
-    frames.append((req1, resp1))
 
-    # Block 2: PDU 3109, qty 42 (1-based register 3110 frequency + PM8240 3144..3150 powerfactors)
-    start2, qty2 = 3109, 42
-    buf2 = bytearray(qty2 * 2)
-    buf2[0:4] = struct.pack(">f", 50.0 + random.uniform(-0.02, 0.02))
-    for pf_reg, pf_val in ((3144, 0.985), (3146, 0.988), (3148, 0.986), (3150, 0.986)):
-        off_pf = (pf_reg - 1 - start2) * 2
-        buf2[off_pf:off_pf + 4] = struct.pack(">f", pf_val)
-    req2 = append_modbus_crc16(struct.pack(">BBHH", slave_id, 3, start2, qty2))
-    resp2 = append_modbus_crc16(struct.pack(">BBB", slave_id, 3, qty2 * 2) + bytes(buf2))
-    frames.append((req2, resp2))
+def encode_register(fmt: str, num_registers: int, value, not_available: bool = False) -> bytes:
+    fmt = fmt.lower()
+    size = num_registers * 2
+    if fmt.startswith("str"):
+        text = "" if not_available else str(value)
+        return text.encode("ascii", errors="ignore")[:size].ljust(size, b"\x00")
+    struct_fmt = _STRUCT[fmt]
+    if not_available:
+        value = float("nan") if fmt.startswith("float") else _INT_NA[fmt]
+    elif not fmt.startswith("float"):
+        value = int(value)
+    return struct.pack(struct_fmt, value)
 
-    # Block 3: PDU 3215, qty 20 (1-based registers 3216 & 3232: PM5561/PM5111 int64 energy accumulators)
-    start3, qty3 = 3215, 20
-    buf3 = bytearray(qty3 * 2)
-    wh = 125000 + slave_id * 1000 + tick * 5
-    varh = 18000 + slave_id * 200 + tick * 1
-    buf3[0:8] = struct.pack(">q", wh)
-    off_reactive = (3232 - 1 - start3) * 2
-    buf3[off_reactive:off_reactive + 8] = struct.pack(">q", varh)
-    req3 = append_modbus_crc16(struct.pack(">BBHH", slave_id, 3, start3, qty3))
-    resp3 = append_modbus_crc16(struct.pack(">BBB", slave_id, 3, qty3 * 2) + bytes(buf3))
-    frames.append((req3, resp3))
 
-    # Block 4: PDU 2705, qty 10 (1-based registers 2706 & 2714: PM8240 float32 energy accumulators)
-    start4, qty4 = 2705, 10
-    buf4 = bytearray(qty4 * 2)
-    buf4[0:4] = struct.pack(">f", float(wh) / 1000.0)
-    off_reac4 = (2714 - 1 - start4) * 2
-    buf4[off_reac4:off_reac4 + 4] = struct.pack(">f", float(varh) / 1000.0)
-    req4 = append_modbus_crc16(struct.pack(">BBHH", slave_id, 3, start4, qty4))
-    resp4 = append_modbus_crc16(struct.pack(">BBB", slave_id, 3, qty4 * 2) + bytes(buf4))
-    frames.append((req4, resp4))
+def build_register_image(slave_id: int, identity: dict, tick: int, na_registers=()) -> dict:
+    """Return {first_register (1-based): bytes} for all point and identity registers."""
+    meter_map = load_meter_map(identity["type"])
+    image = {}
+    for reg_str, spec in meter_map.items():
+        if reg_str == "system" or not isinstance(spec, dict):
+            continue
+        reg = int(reg_str)
+        fmt = spec["format"]
+        value = plausible_value(spec["dbo_name"], fmt, slave_id, tick)
+        image[reg] = encode_register(fmt, int(spec["number_of_registers"]), value, reg in na_registers)
+    for reg_str, spec in (meter_map.get("system") or {}).items():
+        value = identity.get(spec["dbo_name"])
+        if value is None:
+            continue
+        reg = int(reg_str)
+        image[reg] = encode_register(
+            spec["format"], int(spec["number_of_registers"]), value, reg in na_registers
+        )
+    return image
 
+
+def group_blocks(image: dict) -> list:
+    """Group registers into request blocks like a polling master would (start, quantity)."""
+    spans = sorted((reg, reg + len(data) // 2 - 1) for reg, data in image.items())
+    blocks = []
+    for first, last in spans:
+        if blocks and first - blocks[-1][1] <= MAX_BLOCK_GAP and last - blocks[-1][0] < MAX_BLOCK_REGISTERS:
+            blocks[-1][1] = max(blocks[-1][1], last)
+        else:
+            blocks.append([first, last])
+    return [(first, last - first + 1) for first, last in blocks]
+
+
+def build_slave_frames(slave_id: int, tick: int, identity=None, na_registers=(), fail_registers=()) -> list:
+    """Build FC03 RTU (request, response) pairs covering every register in the meter map."""
+    identity = identity or DEFAULT_IDENTITIES[slave_id]
+    image = build_register_image(slave_id, identity, tick, na_registers)
+    frames = []
+    for first, qty in group_blocks(image):
+        pdu_start = first - 1
+        request = append_modbus_crc16(struct.pack(">BBHH", slave_id, 3, pdu_start, qty))
+        if any(first <= reg < first + qty for reg in fail_registers):
+            response = append_modbus_crc16(struct.pack(">BBB", slave_id, 0x83, 0x02))
+        else:
+            buf = bytearray(qty * 2)
+            for reg, data in image.items():
+                if first <= reg < first + qty:
+                    offset = (reg - first) * 2
+                    buf[offset:offset + len(data)] = data
+            response = append_modbus_crc16(struct.pack(">BBB", slave_id, 3, qty * 2) + bytes(buf))
+        frames.append((request, response))
     return frames
+
+
+def _parse_pairs(values) -> dict:
+    pairs = {}
+    for item in values or []:
+        slave, _, reg = item.partition(":")
+        pairs.setdefault(int(slave), set()).add(int(reg))
+    return pairs
 
 
 def main():
@@ -122,8 +202,20 @@ def main():
     parser.add_argument("--topic", default="MXcloudgate", help="Internal MQTT topic")
     parser.add_argument("--slaves", default="1,2,3", help="Comma-separated Modbus slave IDs")
     parser.add_argument("--interval", type=float, default=2.0, help="Publish interval in seconds")
+    parser.add_argument("--identity-file", help="JSON file overriding DEFAULT_IDENTITIES by slave id")
+    parser.add_argument("--na", action="append", metavar="SLAVE:REG", help="Report register as N/A")
+    parser.add_argument(
+        "--fail-block", action="append", metavar="SLAVE:REG",
+        help="Answer the block containing REG with Modbus exception 0x02",
+    )
     args = parser.parse_args()
 
+    identities = dict(DEFAULT_IDENTITIES)
+    if args.identity_file:
+        with open(args.identity_file, "r", encoding="utf-8") as fh:
+            identities.update({int(k): v for k, v in json.load(fh).items()})
+    na_map = _parse_pairs(args.na)
+    fail_map = _parse_pairs(args.fail_block)
     slave_ids = [int(s.strip()) for s in args.slaves.split(",") if s.strip()]
     running = True
 
@@ -147,7 +239,10 @@ def main():
         while running:
             tick += 1
             for sid in slave_ids:
-                for req, resp in build_slave_frames(sid, tick):
+                frames = build_slave_frames(
+                    sid, tick, identities[sid], na_map.get(sid, ()), fail_map.get(sid, ())
+                )
+                for req, resp in frames:
                     msg = json.dumps({"rtu_request": req.hex(), "rtu_response": resp.hex()})
                     client.publish(args.topic, msg, qos=0)
             time.sleep(args.interval)

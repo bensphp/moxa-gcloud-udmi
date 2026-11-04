@@ -215,3 +215,10 @@ fabric.properties
 # UDMI private keys and generated tool outputs
 *_private.*
 udmi_site_model/**/out/
+
+# Device credentials and runtime state (never commit)
+*_private.pem
+*.pkcs8
+*_private.crt
+persistent_data.json
+udmi_site_model/out/

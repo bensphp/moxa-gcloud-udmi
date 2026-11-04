@@ -7,7 +7,6 @@
 
 The app_data instance keeps references to a few global objects.
 """
-import queue
 import threading
 from dataclasses import dataclass
 from typing import Optional

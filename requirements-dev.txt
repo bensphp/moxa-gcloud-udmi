@@ -1,0 +1,3 @@
+# Test dependencies (the runtime dependencies are in requirements.txt)
+-r requirements.txt
+pytest>=7.0

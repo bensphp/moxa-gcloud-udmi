@@ -1,10 +1,45 @@
 #!/usr/bin/env python3
+# This software is licensed under GNU GENERAL PUBLIC LICENSE Version 3, 29 June 2007
+
 import json
 import os
-import sys
 
 from google_iot_core_gateway import ROOT_DIR
+from google_iot_core_gateway.errors import GatewayConfigError
 from google_iot_core_gateway.utils.log import update_logger_verbose_level
+
+SECRET_KEYS = {"mqtt_password", "password", "secret", "token"}
+SYSTEM_STATE_DIR = "/var/lib/moxa-gcloud-udmi"
+CRC_CHECK_MODES = ("strict", "off")
+
+
+def redact_secrets(obj):
+    """Return a copy of a parsed config with secret values replaced, for logging."""
+    if isinstance(obj, dict):
+        return {
+            key: ("***" if key in SECRET_KEYS and value else redact_secrets(value))
+            for key, value in obj.items()
+        }
+    if isinstance(obj, list):
+        return [redact_secrets(item) for item in obj]
+    return obj
+
+
+def _is_writable_dir(path: str) -> bool:
+    if os.path.isdir(path):
+        return os.access(path, os.W_OK)
+    parent = os.path.dirname(path.rstrip("/")) or "/"
+    return os.path.isdir(parent) and os.access(parent, os.W_OK)
+
+
+def default_state_dir() -> str:
+    """systemd StateDirectory= > /var/lib/moxa-gcloud-udmi (if writable) > ~/.local/state/..."""
+    env_dir = os.environ.get("STATE_DIRECTORY")
+    if env_dir:
+        return env_dir.split(":")[0]
+    if _is_writable_dir(SYSTEM_STATE_DIR):
+        return SYSTEM_STATE_DIR
+    return os.path.join(os.path.expanduser("~"), ".local", "state", "moxa-gcloud-udmi")
 
 
 class ConfigHandler:
@@ -38,12 +73,17 @@ class ConfigHandler:
         self.google_cloud__client_key = None
         self.google_cloud__mqtt_username = None
         self.google_cloud__mqtt_password = None
+        self.google_cloud__jwt_expires_minutes = 60
+
+        self.modbus__stale_timeout_sec = 300.0
+        self.modbus__crc_check = "strict"
 
         self.site_details__name = "KGX-1"
         self.site_details__registry_id = "KGX-1"
         self.site_details__gateway_id = "CGW-1"
         self.site_details__serial_no = None
         self.site_details__localnet = None
+        self.site_details__hardware = None
         self.site_details__devices = {
             "EM-1": {
                 "id": "",
@@ -53,6 +93,7 @@ class ConfigHandler:
         }
 
         self.udmi_site_model_path = "/home/moxa/udmi_site_model"
+        self.state_dir = None
         self.resources_path = os.path.join(root_dir, "resources")
         if not os.path.isdir(self.resources_path):
             self.resources_path = root_dir
@@ -76,34 +117,32 @@ class ConfigHandler:
         self._parse_udmi_site_model_configuration()
         # Re-apply explicit CLI overrides on top of cloud_iot_config.json
         self._parse_site_cli_overrides(args)
+        if not self.state_dir:
+            self.state_dir = default_state_dir()
+        self._validate()
         self._print_configuration()
 
     def _read_ext_config(self, config_file=None):
         """Read JSON configuration file."""
         if config_file is None:
             config_file = self._google_cloud_config_file
+        self.logger.info(f"Reading configuration: {config_file}")
         try:
-            self.logger.info(f"*********** Reading External Config: {config_file} ***********")
             with open(config_file, "r", encoding="utf-8") as json_data_file:
                 cfg_obj = json.load(json_data_file)
-                self.logger.debug(f"  ******* External Config:\n  {cfg_obj} *******")
-                return cfg_obj
-        except (FileNotFoundError, IOError, OSError) as e:
-            self.logger.error(f"Invalid path to the config file: {config_file}")
-            self.logger.error(e)
-            return None
+        except (OSError, ValueError) as e:
+            raise GatewayConfigError(f"Cannot read configuration file '{config_file}': {e}") from e
+        self.logger.debug(f"Configuration content: {redact_secrets(cfg_obj)}")
+        return cfg_obj
 
     def _parse_udmi_site_model_configuration(self):
         """Read UDMI Site Model cloud_iot_config.json for registry/region details."""
-        self.logger.info("*********** Parse UDMI Site Model Configuration ***********")
         udmi_site_model_config = os.path.join(
             self.udmi_site_model_path, "cloud_iot_config.json"
         )
         ext_conf = self._read_ext_config(config_file=udmi_site_model_config)
-
         if not ext_conf:
-            self.logger.error("*********** Empty UDMI Site Model Configuration! ***********")
-            sys.exit(1)
+            raise GatewayConfigError(f"Empty UDMI site model configuration '{udmi_site_model_config}'")
 
         if ext_conf.get("cloud_region"):
             self.google_cloud__cloud_region = ext_conf["cloud_region"]
@@ -114,12 +153,9 @@ class ConfigHandler:
 
     def _parse_module_configuration(self):
         """Read config-google-gateway.json for Internal Broker, Cloud, and Modbus proxy devices."""
-        self.logger.info("*********** Parse Module Configuration ***********")
         ext_conf = self._read_ext_config()
-
         if not ext_conf:
-            self.logger.error("*********** Empty Module Configuration! ***********")
-            sys.exit(1)
+            raise GatewayConfigError(f"Empty module configuration '{self._google_cloud_config_file}'")
 
         internal = ext_conf.get("internal_broker") or {}
         if internal.get("mqtt_bridge_hostname"):
@@ -162,6 +198,14 @@ class ConfigHandler:
             self.google_cloud__mqtt_username = gcloud["mqtt_username"]
         if gcloud.get("mqtt_password"):
             self.google_cloud__mqtt_password = gcloud["mqtt_password"]
+        if gcloud.get("jwt_expires_minutes") is not None:
+            self.google_cloud__jwt_expires_minutes = int(gcloud["jwt_expires_minutes"])
+
+        modbus = ext_conf.get("modbus") or {}
+        if modbus.get("stale_timeout_sec") is not None:
+            self.modbus__stale_timeout_sec = float(modbus["stale_timeout_sec"])
+        if modbus.get("crc_check") is not None:
+            self.modbus__crc_check = str(modbus["crc_check"]).lower()
 
         site = ext_conf.get("site_details") or {}
         if site.get("gateway_id"):
@@ -170,6 +214,8 @@ class ConfigHandler:
             self.site_details__serial_no = str(site["serial_no"])
         if site.get("localnet"):
             self.site_details__localnet = site["localnet"]
+        if isinstance(site.get("hardware"), dict):
+            self.site_details__hardware = site["hardware"]
         if site.get("proxy_ids") is not None:
             self.site_details__devices = dict(site["proxy_ids"])
 
@@ -178,12 +224,12 @@ class ConfigHandler:
             self.udmi_site_model_path = env_setup["udmi_site_model_path"]
         if env_setup.get("resources_path"):
             self.resources_path = env_setup["resources_path"]
+        if env_setup.get("state_dir"):
+            self.state_dir = env_setup["state_dir"]
 
     def _parse_args_configuration(self, args=None):
         """Read command line arguments and override settings provided in config files."""
-        self.logger.info("*********** Parse args Configuration ***********")
         if not args:
-            self.logger.info("*********** Empty args Configuration! Skipping! ***********")
             return
 
         if getattr(args, "internal_broker__mqtt_bridge_hostname", None) is not None:
@@ -193,8 +239,6 @@ class ConfigHandler:
 
         if getattr(args, "google_cloud__iot_provider", None) is not None:
             self.google_cloud__iot_provider = args.google_cloud__iot_provider
-        if getattr(args, "google_cloud__cloud_region", None) is not None:
-            self.google_cloud__cloud_region = args.google_cloud__cloud_region
         if getattr(args, "google_cloud__project_id", None) is not None:
             self.google_cloud__project_id = args.google_cloud__project_id
         if getattr(args, "google_cloud__mqtt_bridge_hostname", None) is not None:
@@ -210,10 +254,13 @@ class ConfigHandler:
             self.udmi_site_model_path = args.udmi_site_model_path
         if getattr(args, "resources_path", None) is not None:
             self.resources_path = args.resources_path
+        if getattr(args, "state_dir", None) is not None:
+            self.state_dir = args.state_dir
 
         self._parse_site_cli_overrides(args)
 
     def _parse_site_cli_overrides(self, args=None):
+        """CLI values win over both the module config and the site model cloud_iot_config.json."""
         if not args:
             return
         if getattr(args, "google_cloud__cloud_region", None) is not None:
@@ -227,27 +274,55 @@ class ConfigHandler:
         if getattr(args, "site_details__serial_no", None) is not None:
             self.site_details__serial_no = str(args.site_details__serial_no)
 
+    def _validate(self):
+        if self.modbus__crc_check not in CRC_CHECK_MODES:
+            raise GatewayConfigError(
+                f"modbus.crc_check must be one of {CRC_CHECK_MODES}, got '{self.modbus__crc_check}'"
+            )
+        if self.modbus__stale_timeout_sec <= 0:
+            raise GatewayConfigError("modbus.stale_timeout_sec must be > 0")
+        if self.google_cloud__sample_rate_set <= 0:
+            raise GatewayConfigError("google_cloud.sample_rate_set must be > 0")
+        seen_slaves = {}
+        for device_id, details in self.site_details__devices.items():
+            if not isinstance(details, dict):
+                raise GatewayConfigError(f"site_details.proxy_ids.{device_id} must be an object")
+            for key in ("type", "modbus_slave_id"):
+                if key not in details:
+                    raise GatewayConfigError(f"site_details.proxy_ids.{device_id} is missing '{key}'")
+            try:
+                slave = int(details["modbus_slave_id"])
+            except (TypeError, ValueError) as exc:
+                raise GatewayConfigError(
+                    f"site_details.proxy_ids.{device_id}.modbus_slave_id must be an integer"
+                ) from exc
+            if not 0 <= slave <= 255:
+                raise GatewayConfigError(f"modbus_slave_id {slave} of {device_id} is out of range")
+            if slave in seen_slaves:
+                raise GatewayConfigError(
+                    f"modbus_slave_id {slave} is used by both {seen_slaves[slave]} and {device_id}"
+                )
+            seen_slaves[slave] = device_id
+
     def _print_configuration(self):
         self.logger.info(
-            f"  internal_broker__mqtt_bridge_hostname: {self.internal_broker__mqtt_bridge_hostname}"
+            "Configuration: internal broker %s:%s (tls=%s), cloud %s %s:%s (tls=%s, project=%s, "
+            "region=%s), registry %s, gateway %s, proxies %s, site model %s, state dir %s, "
+            "stale timeout %ss, crc %s",
+            self.internal_broker__mqtt_bridge_hostname,
+            self.internal_broker__mqtt_bridge_port,
+            self.internal_broker__enable_tls,
+            self.google_cloud__iot_provider,
+            self.google_cloud__mqtt_bridge_hostname,
+            self.google_cloud__mqtt_bridge_port,
+            self.google_cloud__enable_tls,
+            self.google_cloud__project_id,
+            self.google_cloud__cloud_region,
+            self.site_details__registry_id,
+            self.site_details__gateway_id,
+            sorted(self.site_details__devices),
+            self.udmi_site_model_path,
+            self.state_dir,
+            self.modbus__stale_timeout_sec,
+            self.modbus__crc_check,
         )
-        self.logger.info(
-            f"  internal_broker__mqtt_bridge_port: {self.internal_broker__mqtt_bridge_port}"
-        )
-        self.logger.info(f"  internal_broker__enable_tls: {self.internal_broker__enable_tls}")
-        self.logger.info(f"  google_cloud__iot_provider: {self.google_cloud__iot_provider}")
-        self.logger.info(f"  google_cloud__cloud_region: {self.google_cloud__cloud_region}")
-        self.logger.info(f"  google_cloud__project_id: {self.google_cloud__project_id}")
-        self.logger.info(
-            f"  google_cloud__mqtt_bridge_hostname: {self.google_cloud__mqtt_bridge_hostname}"
-        )
-        self.logger.info(f"  google_cloud__mqtt_bridge_port: {self.google_cloud__mqtt_bridge_port}")
-        self.logger.info(f"  google_cloud__enable_tls: {self.google_cloud__enable_tls}")
-        self.logger.info(f"  site_details__name: {self.site_details__name}")
-        self.logger.info(f"  site_details__registry_id: {self.site_details__registry_id}")
-        self.logger.info(f"  site_details__gateway_id: {self.site_details__gateway_id}")
-        self.logger.info(f"  site_details__serial_no: {self.site_details__serial_no}")
-        self.logger.info(f"  site_details__devices: {self.site_details__devices}")
-        self.logger.info(f"  udmi_site_model_path: {self.udmi_site_model_path}")
-        self.logger.info(f"  resources_path: {self.resources_path}")
-        self.logger.info("*********** Parse Configuration Successful! ***********")

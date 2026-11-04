@@ -1,3 +1,18 @@
+# This software is licensed under GNU GENERAL PUBLIC LICENSE Version 3, 29 June 2007
+
+"""UDMI 1.5 device engine for the Moxa gateway and its proxied Modbus meters.
+
+Design rules (see README "Data integrity"):
+  * Report what the devices actually say. Identity (serial, make/model, firmware) comes from the
+    meter registers or the gateway itself; the UDMI site model is never echoed back as device data.
+  * Never report network addresses the host does not have.
+  * Telemetry is only published while it is fresh; stale, "not available" or failed points are
+    reported as failures in state and left out of `events/pointset`.
+  * `system.operation.mode = restart` really restarts the process (exit code 192, restarted by the
+    supervisor); `restart_count` is persisted across restarts.
+"""
+
+import collections
 import copy
 import datetime
 import json
@@ -9,6 +24,7 @@ import threading
 import time
 
 from google_iot_core_gateway import UDMI_VERSION, __version__ as GATEWAY_SOFTWARE_VERSION
+from google_iot_core_gateway.modbus_gw.modbus_to_json import ERROR_EXCEPTION
 from google_iot_core_gateway.udmi_handler.modbus_to_dbo import ModbusToDBO
 
 # UDMI numerical log severity levels (Stackdriver LogSeverity)
@@ -19,6 +35,8 @@ LEVEL_WARNING = 400
 LEVEL_ERROR = 500
 
 # Standard UDMI categories
+CATEGORY_SYSTEM_BASE_START = "system.base.start"
+CATEGORY_SYSTEM_BASE_SHUTDOWN = "system.base.shutdown"
 CATEGORY_SYSTEM_BASE_READY = "system.base.ready"
 CATEGORY_SYSTEM_CONFIG_RECEIVE = "system.config.receive"
 CATEGORY_SYSTEM_CONFIG_PARSE = "system.config.parse"
@@ -28,10 +46,23 @@ CATEGORY_POINTSET_POINT_FAILURE = "pointset.point.failure"
 CATEGORY_GATEWAY_PROXY_TARGET = "gateway.proxy.target"
 CATEGORY_GATEWAY_PROXY_CONNECT = "gateway.proxy.connect"
 CATEGORY_GATEWAY_SETUP_ATTACH = "gateway.setup.attach"
+CATEGORY_BLOBSET_BLOB_APPLY = "blobset.blob.apply"
 
 EPOCH_ISO = "1970-01-01T00:00:00Z"
 STATE_THROTTLE_SEC = 2.1
 INITIAL_CONFIG_WAIT_SEC = 10.0
+DEFAULT_STALE_TIMEOUT_SEC = 300.0
+DEFAULT_MIN_LOGLEVEL = LEVEL_NOTICE  # config_system.json: "Default to 300"
+HEALTH_TICK_SEC = 1.0
+LOCALNET_REFRESH_SEC = 60.0
+MAX_PENDING_LOGS = 200
+UNKNOWN_SERIAL = "unknown"
+
+MODE_INITIAL = "initial"
+MODE_ACTIVE = "active"
+MODE_RESTART = "restart"
+
+OS_FAMILIES = ("ether", "ipv4", "ipv6")
 
 UDMI_SUBBLOCKS = (
     "system",
@@ -43,36 +74,18 @@ UDMI_SUBBLOCKS = (
     "alarmset",
 )
 
-OFFICIAL_UDMI_BUCKETS = {
-    "endpoint",
-    "endpoint.config",
-    "enumeration",
-    "enumeration.pointset",
-    "enumeration.features",
-    "enumeration.families",
-    "discovery",
-    "discovery.scan",
-    "gateway",
-    "pointset",
-    "system",
-    "system.mode",
-    "system.software",
-    "system.software.updates",
-    "writeback",
-}
-
-DEFAULT_GATEWAY_FEATURES = {
+# Features this implementation really supports. They are reported in self-enumeration as-is and
+# are never derived from the site model (the site model must match them, not the other way round).
+GATEWAY_FEATURES = {
     "system": {"stage": "stable"},
-    "pointset": {"stage": "stable"},
     "gateway": {"stage": "beta"},
     "system.mode": {"stage": "beta"},
     "enumeration": {"stage": "beta"},
     "enumeration.families": {"stage": "beta"},
     "enumeration.features": {"stage": "beta"},
-    "enumeration.pointset": {"stage": "beta"},
 }
 
-DEFAULT_PROXY_FEATURES = {
+PROXY_FEATURES = {
     "system": {"stage": "stable"},
     "pointset": {"stage": "stable"},
     "gateway": {"stage": "beta"},
@@ -82,13 +95,130 @@ DEFAULT_PROXY_FEATURES = {
     "enumeration.pointset": {"stage": "beta"},
 }
 
+# Modbus exception codes that describe a persistent problem with the requested registers. Other
+# codes (busy, gateway timeouts, ...) are transient and only matter if they persist long enough
+# for the affected points to go stale.
+PERSISTENT_EXCEPTION_CODES = {0x01, 0x02, 0x03, 0x04}
 
-def _detect_host_network_families(preferred_config=None, metadata_localnet=None):
+# UDMI ModbusFamilyProvider grammar (validator/.../providers/ModbusFamilyProvider.java)
+_MODBUS_URL_RE = re.compile(r"^modbus://(?P<addr>[^/?]+)/(?P<point>.+)$")
+_MODBUS_POINT_WITH_UNIT_RE = re.compile(
+    r"^(?P<unitid>\d+)/(?P<fc>\d+)/(?P<address>\d+)(?:/(?P<qty>\d+))?(?:\?(?P<query>.*))?$"
+)
+_MODBUS_POINT_NO_UNIT_RE = re.compile(
+    r"^(?P<fc>\d+)/(?P<address>\d+)(?:/(?P<qty>\d+))?(?:\?(?P<query>.*))?$"
+)
+_LEGACY_REGISTER_REF_RE = re.compile(r"^\d+$")
+_MODBUS_ALLOWED_FCS = {"1", "2", "3", "4", "5", "6", "15", "16"}
+_MODBUS_READ_FCS = {3, 4}
+_MODBUS_ALLOWED_PARAMS = {"border", "type", "worder", "scale", "offset"}
+_MODBUS_ALLOWED_BORDERS = {"MSB", "LSB"}
+_MODBUS_ALLOWED_WORDERS = {"HWF", "LWF"}
+_MODBUS_ALLOWED_TYPES = {
+    "INT16", "INT32", "INT64", "UINT16", "UINT32", "UINT64",
+    "FLOAT32", "FLOAT64", "BOOLEAN", "ASCII",
+}
+_FORMAT_TO_MODBUS_TYPE = {
+    "float32": "FLOAT32",
+    "float64": "FLOAT64",
+    "int16": "INT16",
+    "int16s": "INT16",
+    "int16u": "UINT16",
+    "uint16": "UINT16",
+    "int32": "INT32",
+    "int32s": "INT32",
+    "int32u": "UINT32",
+    "uint32": "UINT32",
+    "int64": "INT64",
+    "int64u": "UINT64",
+    "uint64": "UINT64",
+}
+
+
+def parse_modbus_ref(ref: str, unit_from_context: bool) -> dict:
     """
-    Discover local network addresses (ether, ipv4, ipv6) from the Linux host,
-    reconciling multi-NIC gateways (e.g. Moxa UC8220 eth0/eth1) with configured
-    or metadata expectations when present.
+    Parse a UDMI Modbus point reference.
+
+    Accepted forms (UDMI ModbusFamilyProvider):
+      * full URL:  modbus://<addr>/<unitid>/<function>/<address>[/<quantity>][?params]
+      * relative:  <function>/<address>[/<quantity>][?params] when the device's
+                   localnet.families.modbus supplies the unit id, otherwise
+                   <unitid>/<function>/<address>[/<quantity>][?params]
+      * legacy:    <register> (bare register number, e.g. "3028")
+
+    Raises ValueError with a human readable reason.
     """
+    text = str(ref).strip()
+    parsed = {
+        "addr": None,
+        "unitid": None,
+        "fc": None,
+        "address": None,
+        "quantity": None,
+        "params": {},
+        "legacy": False,
+    }
+    url_match = _MODBUS_URL_RE.match(text)
+    if url_match:
+        parsed["addr"] = url_match.group("addr")
+        point_match = _MODBUS_POINT_WITH_UNIT_RE.match(url_match.group("point"))
+        if not point_match:
+            raise ValueError(
+                "does not match modbus://<addr>/<unitid>/<function>/<address>[/<quantity>][?params]"
+            )
+    elif _LEGACY_REGISTER_REF_RE.match(text):
+        parsed["address"] = int(text)
+        parsed["legacy"] = True
+        return parsed
+    else:
+        pattern = _MODBUS_POINT_NO_UNIT_RE if unit_from_context else _MODBUS_POINT_WITH_UNIT_RE
+        point_match = pattern.match(text)
+        if not point_match:
+            expected = (
+                "<function>/<address>[/<quantity>][?params]"
+                if unit_from_context
+                else "<unitid>/<function>/<address>[/<quantity>][?params]"
+            )
+            raise ValueError(f"does not match {expected}")
+
+    groups = point_match.groupdict()
+    if groups.get("unitid") is not None:
+        unit = int(groups["unitid"])
+        if unit > 255:
+            raise ValueError(f"unit id {unit} exceeds 255")
+        parsed["unitid"] = unit
+    if groups["fc"] not in _MODBUS_ALLOWED_FCS:
+        raise ValueError(f"invalid modbus function code {groups['fc']}")
+    parsed["fc"] = int(groups["fc"])
+    parsed["address"] = int(groups["address"])
+    if groups.get("qty") is not None:
+        parsed["quantity"] = int(groups["qty"])
+
+    query = groups.get("query")
+    if query:
+        for param in query.split("&"):
+            key, sep, value = param.partition("=")
+            if key not in _MODBUS_ALLOWED_PARAMS:
+                raise ValueError(f"invalid modbus interpretation parameter '{key}'")
+            if not sep or not value:
+                raise ValueError(f"missing value for modbus parameter '{key}'")
+            if key == "border" and value not in _MODBUS_ALLOWED_BORDERS:
+                raise ValueError(f"invalid modbus border value {value}")
+            if key == "worder" and value not in _MODBUS_ALLOWED_WORDERS:
+                raise ValueError(f"invalid modbus worder value {value}")
+            if key == "type" and value not in _MODBUS_ALLOWED_TYPES:
+                raise ValueError(f"invalid modbus type value {value}")
+            if key in ("scale", "offset"):
+                try:
+                    float(value)
+                except ValueError:
+                    raise ValueError(f"invalid modbus {key} value {value}") from None
+            parsed["params"][key] = value
+    return parsed
+
+
+def _list_host_interfaces():
+    """Return (interfaces, has_ip_info) for non-loopback host interfaces."""
     interfaces = []
     try:
         proc = subprocess.run(
@@ -100,124 +230,103 @@ def _detect_host_network_families(preferred_config=None, metadata_localnet=None)
         )
         if proc.returncode == 0 and proc.stdout.strip():
             for iface in json.loads(proc.stdout):
-                if iface.get("ifname") == "lo":
+                if iface.get("ifname") == "lo" or iface.get("link_type") == "loopback":
                     continue
                 entry = {"ifname": iface.get("ifname", "")}
                 mac = iface.get("address")
                 if mac and mac != "00:00:00:00:00:00":
-                    entry["ether"] = mac.lower()
+                    entry["ether"] = str(mac).lower()
                 for addr_info in iface.get("addr_info") or []:
-                    fam = addr_info.get("family")
+                    family = addr_info.get("family")
                     scope = addr_info.get("scope")
                     local = addr_info.get("local")
                     if not local or scope == "host":
                         continue
-                    if fam == "inet" and "ipv4" not in entry:
+                    if family == "inet" and "ipv4" not in entry:
                         entry["ipv4"] = local
-                    elif fam == "inet6" and scope == "global" and "ipv6" not in entry:
+                    elif family == "inet6" and scope == "global" and "ipv6" not in entry:
                         entry["ipv6"] = local
                 interfaces.append(entry)
-    except Exception:
+            if interfaces:
+                return interfaces, True
+    except (OSError, ValueError, subprocess.SubprocessError):
         pass
 
-    # Fallback via /sys/class/net and socket if `ip -j addr` was unavailable
-    if not interfaces and os.path.isdir("/sys/class/net"):
+    # Fallback (no iproute2): MAC addresses from sysfs only.
+    if os.path.isdir("/sys/class/net"):
         for ifname in sorted(os.listdir("/sys/class/net")):
             if ifname == "lo":
                 continue
             entry = {"ifname": ifname}
-            addr_file = os.path.join("/sys/class/net", ifname, "address")
             try:
-                with open(addr_file, "r", encoding="utf-8") as fh:
+                with open(
+                    os.path.join("/sys/class/net", ifname, "address"), "r", encoding="utf-8"
+                ) as fh:
                     mac = fh.read().strip().lower()
                 if mac and mac != "00:00:00:00:00:00":
                     entry["ether"] = mac
             except OSError:
                 pass
             interfaces.append(entry)
+    return interfaces, False
 
-    families = {}
-    if interfaces:
-        primary = interfaces[0]
-        for key in ("ether", "ipv4", "ipv6"):
-            for iface in interfaces:
-                if key in iface:
-                    families[key] = {"addr": iface[key]}
-                    break
-            if key in primary:
-                families[key] = {"addr": primary[key]}
 
-    if "ipv4" not in families:
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-                sock.connect(("8.8.8.8", 80))
-                families["ipv4"] = {"addr": sock.getsockname()[0]}
-        except OSError:
-            pass
+def _primary_ipv4_via_route():
+    """Source IPv4 address the kernel would use for the default route (no packets are sent)."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("8.8.8.8", 80))
+            return sock.getsockname()[0]
+    except OSError:
+        return None
 
-    # Reconcile multi-NIC selection or explicit metadata/config overrides
+
+def detect_host_network_families(preferred_interface=None, metadata_localnet=None) -> dict:
+    """
+    Detect the gateway's own ether/ipv4/ipv6 addresses.
+
+    Site-model addresses are only used to pick the matching NIC on multi-NIC gateways; an address
+    that does not exist on the host is never reported.
+    """
+    interfaces, has_ip_info = _list_host_interfaces()
+    expected = {}
     meta_families = (metadata_localnet or {}).get("families") or {}
     for fam_name, fam_spec in meta_families.items():
-        if not isinstance(fam_spec, dict):
-            continue
-        expected_addr = fam_spec.get("addr")
-        if expected_addr:
-            # Select matching NIC on multi-NIC gateways (eth0/eth1); only fall back to
-            # metadata for non-OS fieldbus families (e.g. vendor/modbus) or if no NICs exist.
-            matched_iface = next(
-                (iface for iface in interfaces if iface.get(fam_name) == str(expected_addr).lower() or iface.get(fam_name) == str(expected_addr)),
-                None,
-            )
-            if matched_iface is not None:
-                families[fam_name] = {"addr": matched_iface[fam_name]}
-            elif fam_name not in ("ether", "ipv4", "ipv6") or not families.get(fam_name):
-                families[fam_name] = {"addr": str(expected_addr)}
-        elif fam_name not in families:
-            families[fam_name] = {}
+        if fam_name in OS_FAMILIES and isinstance(fam_spec, dict) and fam_spec.get("addr"):
+            expected[fam_name] = str(fam_spec["addr"]).lower()
 
-    if isinstance(preferred_config, dict):
-        pref_ifname = preferred_config.get("interface")
-        if pref_ifname:
-            for iface in interfaces:
-                if iface.get("ifname") == pref_ifname:
-                    for key in ("ether", "ipv4", "ipv6"):
-                        if key in iface:
-                            families[key] = {"addr": iface[key]}
-                    break
-        for fam_name, addr_val in (preferred_config.get("families") or {}).items():
-            if isinstance(addr_val, dict):
-                families[fam_name] = (
-                    {"addr": str(addr_val["addr"])} if addr_val.get("addr") is not None else {}
-                )
-            elif isinstance(addr_val, str):
-                families[fam_name] = {"addr": addr_val}
+    chosen = None
+    if preferred_interface:
+        chosen = next((i for i in interfaces if i.get("ifname") == preferred_interface), None)
+    if chosen is None and expected:
+        chosen = next(
+            (
+                i
+                for i in interfaces
+                if any(str(i.get(fam, "")).lower() == addr for fam, addr in expected.items())
+            ),
+            None,
+        )
+    if chosen is None and interfaces:
+        chosen = next((i for i in interfaces if "ipv4" in i), interfaces[0])
 
+    families = {}
+    if chosen is not None:
+        for fam_name in OS_FAMILIES:
+            if chosen.get(fam_name):
+                families[fam_name] = {"addr": chosen[fam_name]}
+    if not has_ip_info and "ipv4" not in families:
+        route_ip = _primary_ipv4_via_route()
+        if route_ip:
+            families["ipv4"] = {"addr": route_ip}
     return families
 
 
-_MODBUS_UDMI_REF_RE = re.compile(
-    r"^(?:modbus://[A-Za-z0-9_.:-]+/)?(?:(\d+)/)?(\d+)/(\d+)(?:/(\d+))?(?:\?(.*))?$"
-)
-_MODBUS_ALLOWED_FCS = {"1", "2", "3", "4", "5", "6", "15", "16"}
-_MODBUS_ALLOWED_PARAMS = {"border", "type", "worder", "scale", "offset"}
-
-
-def _build_proxied_localnet_families(metadata_localnet=None) -> dict:
-    """Build `state.localnet.families` for a proxied device from its metadata only."""
-    families = {}
-    meta_families = (metadata_localnet or {}).get("families") or {}
-    for fam_name, fam_spec in meta_families.items():
-        if isinstance(fam_spec, dict) and fam_spec.get("addr") is not None:
-            families[str(fam_name)] = {"addr": str(fam_spec["addr"])}
-        else:
-            families[str(fam_name)] = {}
-    return families
-
-
-def _detect_hardware_serial(default_serial: str) -> str:
-    """Attempt to read hardware serial number on Linux/ARM gateways (e.g. Moxa UC8220)."""
+def detect_hardware_serial():
+    """Read the hardware serial number on Linux gateways, or None if the platform hides it."""
     candidates = [
         "/sys/firmware/devicetree/base/serial-number",
+        "/proc/device-tree/serial-number",
         "/sys/class/dmi/id/product_serial",
     ]
     for path in candidates:
@@ -229,7 +338,7 @@ def _detect_hardware_serial(default_serial: str) -> str:
                     return serial
         except OSError:
             continue
-    return default_serial
+    return None
 
 
 def _collect_host_metrics() -> dict:
@@ -250,19 +359,19 @@ def _collect_host_metrics() -> dict:
             free_key = "MemAvailable" if "MemAvailable" in mem_kb else "MemFree"
             if free_key in mem_kb:
                 metrics["mem_free_mb"] = round(mem_kb[free_key] / 1024.0, 2)
-    except Exception:
+    except (OSError, ValueError):
         pass
 
     try:
         stat = os.statvfs("/")
         metrics["store_total_mb"] = round((stat.f_blocks * stat.f_frsize) / (1024.0 * 1024.0), 2)
         metrics["store_free_mb"] = round((stat.f_bavail * stat.f_frsize) / (1024.0 * 1024.0), 2)
-    except Exception:
+    except OSError:
         pass
 
     try:
         metrics["system_load"] = round(os.getloadavg()[0], 2)
-    except Exception:
+    except OSError:
         pass
 
     return metrics
@@ -270,8 +379,10 @@ def _collect_host_metrics() -> dict:
 
 class UDMIHandler:
     """
-    UDMI 1.5.2+ compliant state, config, logging, localnet, gateway, and pointset manager
-    for both the Moxa gateway device (e.g. CGW-2) and its proxied Modbus devices (e.g. EM-11..13).
+    UDMI 1.5 state, config, logging, localnet, gateway and pointset manager for the Moxa gateway
+    device (e.g. CGW-2) and its proxied Modbus devices (e.g. EM-11..13).
+
+    All public methods are thread-safe.
     """
 
     def __init__(
@@ -281,19 +392,25 @@ class UDMIHandler:
         udmi_site_model_path,
         default_sample_rate_sec=30.0,
         config_wait_timeout_sec=INITIAL_CONFIG_WAIT_SEC,
+        stale_timeout_sec=DEFAULT_STALE_TIMEOUT_SEC,
     ):
         self.logger = logger
         self.resources_path = resources_path
         self.udmi_site_model_path = udmi_site_model_path
         self.default_sample_rate_sec = float(default_sample_rate_sec)
         self.config_wait_timeout_sec = float(config_wait_timeout_sec)
+        self.stale_timeout_sec = float(stale_timeout_sec)
 
         self._lock = threading.RLock()
         self._last_ts_ms = 0
-        self._boot_mono = time.monotonic()
+        self._start_mono = time.monotonic()
         self._boot_iso = self._rounded_utc_now()
+        self._last_health_tick = 0.0
+        self._next_localnet_refresh = self._start_mono + LOCALNET_REFRESH_SEC
+        self._restart_requested = False
+        self._log_throttle = {}
 
-        # Backward-compatible slave_id (str) -> device record mapping for Modbus slaves
+        # slave_id (str) -> device record for proxied Modbus slaves
         self.devices = {}
         # All managed UDMI devices (gateway + proxied devices) keyed by device_id
         self.devices_by_id = {}
@@ -301,41 +418,21 @@ class UDMIHandler:
 
         self._modbus_dbo_map = ModbusToDBO(logger, resources_path).map
 
+    # ------------------------------------------------------------------ helpers
+
     @staticmethod
     def _rounded_utc_now() -> str:
         now = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
         return now.strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    @staticmethod
-    def _next_start_iso_after(prev_iso: str) -> str:
-        prev_sec = 0
-        try:
-            clean = str(prev_iso or "").strip()
-            if clean.endswith("Z"):
-                clean = clean[:-1] + "+00:00"
-            prev_dt = datetime.datetime.fromisoformat(clean)
-            prev_sec = int(prev_dt.timestamp())
-        except Exception:
-            prev_sec = 0
-        next_sec = max(int(time.time()), prev_sec + 1)
-        return datetime.datetime.fromtimestamp(next_sec, tz=datetime.timezone.utc).strftime(
-            "%Y-%m-%dT%H:%M:%SZ"
-        )
+    @property
+    def dbo_maps(self) -> dict:
+        return self._modbus_dbo_map
 
-    @staticmethod
-    def _resolve_supported_features(metadata: dict, is_gateway: bool) -> dict:
-        defaults = DEFAULT_GATEWAY_FEATURES if is_gateway else DEFAULT_PROXY_FEATURES
-        meta_features = (metadata or {}).get("features")
-        if isinstance(meta_features, dict) and meta_features:
-            resolved = {}
-            for key, spec in meta_features.items():
-                if key not in OFFICIAL_UDMI_BUCKETS or not isinstance(spec, dict):
-                    continue
-                stage = str(spec.get("stage") or "stable")
-                resolved[str(key)] = {"stage": stage}
-            if resolved:
-                return resolved
-        return copy.deepcopy(defaults)
+    @property
+    def restart_requested(self) -> bool:
+        with self._lock:
+            return self._restart_requested
 
     def get_timestamp(self) -> str:
         """Return strictly monotonic RFC 3339 UTC timestamp with millisecond precision."""
@@ -359,6 +456,17 @@ class UDMIHandler:
             entry["detail"] = str(detail)
         return entry
 
+    def _log_throttled(self, key, level_fn, message, interval_sec=300.0):
+        """Python-log `message` at most once per `interval_sec` for `key` (protects flash storage)."""
+        now = time.monotonic()
+        last, suppressed = self._log_throttle.get(key, (None, 0))
+        if last is None or now - last >= interval_sec:
+            suffix = f" ({suppressed} similar messages suppressed)" if suppressed else ""
+            level_fn(message + suffix)
+            self._log_throttle[key] = (now, 0)
+        else:
+            self._log_throttle[key] = (last, suppressed + 1)
+
     def _load_device_metadata(self, device_id: str):
         metadata_file_path = os.path.join(
             self.udmi_site_model_path, "devices", device_id, "metadata.json"
@@ -368,143 +476,69 @@ class UDMIHandler:
         try:
             with open(metadata_file_path, "r", encoding="utf-8") as metadata_file:
                 return json.load(metadata_file)
-        except Exception as exc:
+        except (OSError, ValueError) as exc:
             self.logger.error(f"Failed to parse metadata for '{device_id}': {exc}")
             return None
 
-    def _build_initial_subblocks(self, metadata: dict, is_gateway: bool) -> set:
+    @staticmethod
+    def _build_initial_subblocks(metadata: dict) -> set:
         subblocks = {"system"}
         if isinstance(metadata, dict):
             for block in UDMI_SUBBLOCKS:
                 if metadata.get(block) is not None:
                     subblocks.add(block)
-        else:
-            if is_gateway:
-                subblocks.add("gateway")
-            else:
-                subblocks.update({"gateway", "pointset"})
         return subblocks
 
-    def _create_base_device_record(
-        self,
-        device_id: str,
-        is_gateway: bool,
-        metadata: dict = None,
-        serial_no: str = None,
-        default_make: str = "Moxa",
-        default_model: str = "UC8220",
-        default_software: dict = None,
-        localnet_config: dict = None,
-    ) -> dict:
-        sys_meta = (metadata or {}).get("system") or {}
-        hw_meta = sys_meta.get("hardware") or {}
-        sw_meta = sys_meta.get("software")
-
-        hardware = {
-            "make": str(hw_meta.get("make") or default_make),
-            "model": str(hw_meta.get("model") or default_model),
-        }
-        if hw_meta.get("sku"):
-            hardware["sku"] = str(hw_meta["sku"])
-        if hw_meta.get("rev"):
-            hardware["rev"] = str(hw_meta["rev"])
-
-        if isinstance(sw_meta, dict) and sw_meta:
-            software = {str(k): str(v) for k, v in sw_meta.items()}
-            software_pinned = True
-        else:
-            software = dict(default_software or {"firmware": GATEWAY_SOFTWARE_VERSION})
-            software_pinned = False
-
-        hardware_pinned = bool(hw_meta.get("make") and hw_meta.get("model"))
-
-        resolved_serial = (
-            str(serial_no)
-            if serial_no
-            else str(sys_meta.get("serial_no") or "")
-        )
-        serial_pinned = bool(serial_no or sys_meta.get("serial_no"))
-        if not resolved_serial:
-            if is_gateway:
-                resolved_serial = _detect_hardware_serial(f"{device_id}-SN")
-            else:
-                resolved_serial = f"{device_id}-SN"
-
-        meta_points = copy.deepcopy(((metadata or {}).get("pointset") or {}).get("points") or {})
-        active_subblocks = self._build_initial_subblocks(metadata, is_gateway=is_gateway)
-
-        if is_gateway:
-            localnet_families = _detect_host_network_families(
-                preferred_config=localnet_config,
-                metadata_localnet=(metadata or {}).get("localnet"),
-            )
-        else:
-            localnet_families = _build_proxied_localnet_families(
-                metadata_localnet=(metadata or {}).get("localnet"),
-            )
-
+    def _create_base_device_record(self, device_id: str, is_gateway: bool, metadata: dict) -> dict:
         now_mono = time.monotonic()
         record = {
             "device_id": device_id,
             "is_gateway": is_gateway,
             "metadata": metadata or {},
-            "hardware": hardware,
-            "hardware_pinned": hardware_pinned,
-            "software": software,
-            "software_pinned": software_pinned,
-            "serial_no": resolved_serial,
-            "serial_pinned": serial_pinned,
+            "hardware": {},
+            "software": {},
+            "serial_no": UNKNOWN_SERIAL,
+            "configured_serial": None,
             "last_config": EPOCH_ISO,
             "operational": True,
-            "operation_mode": "active",
-            "last_start": self._boot_iso,
-            "restart_count": 1,
-            "restart_handled": False,
             "system_status": None,
-            "gateway_status": None,
-            "min_loglevel": LEVEL_INFO,
+            "min_loglevel": DEFAULT_MIN_LOGLEVEL,
             "metrics_rate_sec": 0.0,
             "next_metrics_mono": 0.0,
             "event_no": 0,
-            "pending_logs": [],
+            "pending_logs": collections.deque(maxlen=MAX_PENDING_LOGS),
             "discovery_generation": None,
             "pending_discovery_events": [],
-            "supported_features": self._resolve_supported_features(metadata, is_gateway=is_gateway),
-            "active_subblocks": active_subblocks,
-            "localnet_families": localnet_families,
+            "supported_features": copy.deepcopy(GATEWAY_FEATURES if is_gateway else PROXY_FEATURES),
+            "active_subblocks": self._build_initial_subblocks(metadata),
+            "localnet_families": {},
             "default_sample_rate_sec": self.default_sample_rate_sec,
             "sample_interval_sec": self.default_sample_rate_sec,
             "next_pointset_mono": now_mono + min(2.0, self.default_sample_rate_sec),
             "known_points": {},
-            "enumerable_points": list(meta_points.keys())
-            if isinstance(((metadata or {}).get("pointset") or {}).get("points"), dict)
-            else None,
             "configured_points": {},
             "points": {},
+            "point_sigs": {},
+            "point_entries": {},
+            "blob_states": {},
             "has_received_config": False,
             "created_mono": now_mono,
             "state_dirty": True,
-            "last_state_publish_mono": 0.0,
+            "force_state": False,
+            "last_state_publish_mono": None,
             "last_published_state_canonical": None,
+            # Gateway status sources (most important first)
+            "target_status": None,
+            "setup_status": None,
+            "connect_status": None,
+            "connect_sig": None,
+            "attach_status": None,
+            "attach_errors": {},
+            # Proxy communication health
+            "last_rx_mono": None,
+            "last_error": None,
+            "restart_requested": False,
         }
-
-        # Populate initial known points & configured points from metadata
-        for pt_name, pt_meta in meta_points.items():
-            pt_meta = pt_meta or {}
-            valid_refs = set()
-            if pt_meta.get("ref") is not None:
-                valid_refs.add(str(pt_meta["ref"]))
-            record["known_points"][pt_name] = {
-                "units": pt_meta.get("units"),
-                "valid_refs": valid_refs,
-            }
-            record["configured_points"][pt_name] = dict(pt_meta)
-            record["points"][pt_name] = {
-                "present_value": None,
-                "hardware_error": None,
-            }
-
-        # Queue initial system.base.ready notice log
         self._queue_log_locked(
             record,
             self.make_entry(
@@ -515,43 +549,83 @@ class UDMIHandler:
         )
         return record
 
+    # ------------------------------------------------------------- registration
+
     def register_gateway(
         self,
         gateway_id: str,
         proxy_ids=None,
         serial_no: str = None,
         localnet_config: dict = None,
+        restart_count: int = 1,
+        hardware: dict = None,
     ) -> bool:
         """Register the gateway device itself (e.g. CGW-2) as a first-class UDMI device."""
         with self._lock:
             metadata = self._load_device_metadata(gateway_id)
             if metadata is None:
                 self.logger.warning(
-                    f"Gateway '{gateway_id}' metadata.json not found in '{self.udmi_site_model_path}'; using defaults"
+                    f"Gateway '{gateway_id}' metadata.json not found in '{self.udmi_site_model_path}'"
                 )
-            record = self._create_base_device_record(
-                device_id=gateway_id,
-                is_gateway=True,
-                metadata=metadata,
-                serial_no=serial_no,
-                default_make="Moxa",
-                default_model="UC8220",
-                default_software={"firmware": GATEWAY_SOFTWARE_VERSION},
-                localnet_config=localnet_config,
+            record = self._create_base_device_record(gateway_id, True, metadata)
+
+            hw_cfg = hardware if isinstance(hardware, dict) else {}
+            record["hardware"] = {
+                "make": str(hw_cfg.get("make") or "Moxa"),
+                "model": str(hw_cfg.get("model") or "UC8220"),
+            }
+            record["software"] = {"firmware": GATEWAY_SOFTWARE_VERSION}
+
+            detected_serial = detect_hardware_serial()
+            record["configured_serial"] = str(serial_no) if serial_no else None
+            if detected_serial:
+                record["serial_no"] = detected_serial
+                if serial_no and str(serial_no) != detected_serial:
+                    self.logger.warning(
+                        f"Configured gateway serial '{serial_no}' differs from hardware serial "
+                        f"'{detected_serial}'; reporting the hardware serial"
+                    )
+            elif serial_no:
+                record["serial_no"] = str(serial_no)
+            else:
+                self.logger.warning(
+                    "Gateway serial number unknown: hardware does not expose it and "
+                    "site_details.serial_no / --serial-no is not set"
+                )
+
+            record["operation_mode"] = MODE_INITIAL
+            record["last_start"] = self._boot_iso
+            record["restart_count"] = max(1, int(restart_count or 1))
+            record["preferred_interface"] = (localnet_config or {}).get("interface") if isinstance(
+                localnet_config, dict
+            ) else None
+            record["localnet_families"] = detect_host_network_families(
+                preferred_interface=record["preferred_interface"],
+                metadata_localnet=(metadata or {}).get("localnet"),
             )
+
             if proxy_ids is not None:
-                record["configured_proxy_ids"] = list(proxy_ids)
+                record["configured_proxy_ids"] = [str(p) for p in proxy_ids]
             else:
                 gw_meta_proxies = ((metadata or {}).get("gateway") or {}).get("proxy_ids") or []
-                record["configured_proxy_ids"] = list(gw_meta_proxies)
+                record["configured_proxy_ids"] = [str(p) for p in gw_meta_proxies]
 
+            self._queue_log_locked(
+                record,
+                self.make_entry(
+                    CATEGORY_SYSTEM_BASE_START,
+                    LEVEL_NOTICE,
+                    f"Gateway software {GATEWAY_SOFTWARE_VERSION} started "
+                    f"(restart_count {record['restart_count']})",
+                ),
+            )
             self.gateway_id = gateway_id
             self.devices_by_id[gateway_id] = record
             return True
 
-    def add_device_to_dict(self, modbus_slave_id, device_id, device_type, serial_no=None):
+    def add_device_to_dict(self, modbus_slave_id, device_id, device_type, serial_no=None, port=None):
         """
-        Register a proxied Modbus slave device (e.g. EM-11 -> slave 1, PM5111).
+        Register a proxied Modbus slave device (e.g. EM-11 -> slave 1, PM5561).
         Maintains both `self.devices[str(modbus_slave_id)]` and `self.devices_by_id[device_id]`.
         """
         with self._lock:
@@ -562,72 +636,100 @@ class UDMIHandler:
                 )
                 return False
 
-            slave_key = str(modbus_slave_id)
-            record = self._create_base_device_record(
-                device_id=device_id,
-                is_gateway=False,
-                metadata=metadata,
-                serial_no=serial_no,
-                default_make="Schneider Electric",
-                default_model=str(device_type),
-                default_software={"firmware": "1.0"},
-            )
-            record["device_type"] = str(device_type)
+            device_type = str(device_type)
+            meter_map = self._modbus_dbo_map.get(device_type)
+            if not meter_map:
+                self.logger.error(
+                    f"No Modbus-to-DBO map for device type '{device_type}' of '{device_id}'"
+                )
+                return False
+
+            slave_id = int(modbus_slave_id)
+            slave_key = str(slave_id)
+            record = self._create_base_device_record(device_id, False, metadata)
+            record["device_type"] = device_type
             record["modbus_slave_id"] = slave_key
+            record["slave_id_int"] = slave_id
+            record["port"] = str(port) if port else None
+            record["configured_serial"] = str(serial_no) if serial_no else None
+            record["serial_no"] = str(serial_no) if serial_no else UNKNOWN_SERIAL
+            # Defaults implied by the configured register map; replaced by meter-reported values.
+            record["hardware"] = {"make": "Schneider Electric", "model": device_type}
+            record["software"] = {}
 
-            # Configure valid gateway.target expectations for ProxiedSequences validation
-            gw_meta = (metadata.get("gateway") or {})
-            target_meta = gw_meta.get("target") or {}
-            ln_families = ((metadata.get("localnet") or {}).get("families") or {})
-            valid_families = {"modbus", "vendor"}
-            if target_meta.get("family"):
-                valid_families.add(str(target_meta["family"]))
-            for fam_key in ln_families:
-                valid_families.add(str(fam_key))
-            valid_addrs = {
-                slave_key,
-                f"0x{int(modbus_slave_id):02x}",
-                "ttyM0",
-                "ttyM1",
-                "ttyS0",
-                "ttyUSB0",
-            }
-            if target_meta.get("addr") is not None:
-                valid_addrs.add(str(target_meta["addr"]))
-            for fam_spec in ln_families.values():
-                if isinstance(fam_spec, dict) and fam_spec.get("addr") is not None:
-                    valid_addrs.add(str(fam_spec["addr"]))
-            record["valid_target_families"] = valid_families
+            ln_modbus = ((metadata.get("localnet") or {}).get("families") or {}).get("modbus")
+            ln_modbus = ln_modbus if isinstance(ln_modbus, dict) else {}
+            meta_unit = ln_modbus.get("unitid")
+            meta_addr = ln_modbus.get("addr")
+            record["unit_in_context"] = meta_unit is not None and str(meta_unit) != ""
+
+            setup_problems = []
+            if record["unit_in_context"] and str(meta_unit) != slave_key:
+                setup_problems.append(
+                    f"site model unitid {meta_unit} does not match configured modbus_slave_id {slave_key}"
+                )
+            if port and meta_addr and str(meta_addr) != str(port):
+                setup_problems.append(
+                    f"site model modbus addr '{meta_addr}' does not match configured port '{port}'"
+                )
+            if setup_problems:
+                message = "; ".join(setup_problems)
+                self.logger.error(f"{device_id}: {message}")
+                record["setup_status"] = self.make_entry(
+                    CATEGORY_GATEWAY_PROXY_TARGET, LEVEL_ERROR, message
+                )
+
+            valid_addrs = {slave_key, f"0x{slave_id:02x}"}
+            if port:
+                valid_addrs.add(str(port))
+            elif meta_addr:
+                valid_addrs.add(str(meta_addr))
             record["valid_target_addrs"] = valid_addrs
+            record["valid_target_families"] = {"modbus"}
 
-            # Enrich known_points and valid_refs from the meter's Modbus-to-DBO register map
-            meter_map = self._modbus_dbo_map.get(str(device_type)) or {}
+            if ln_modbus or port:
+                record["localnet_families"] = {"modbus": {"addr": str(port)} if port else {}}
+
+            # Points this gateway can actually read for the meter (from the register map).
             for reg_str, spec in meter_map.items():
                 if reg_str == "system" or not isinstance(spec, dict):
                     continue
                 dbo_name = spec.get("dbo_name")
-                if not dbo_name:
+                if not dbo_name or not str(reg_str).isdigit():
                     continue
-                pt_info = record["known_points"].setdefault(
-                    dbo_name, {"units": spec.get("units"), "valid_refs": set()}
-                )
-                pt_info["register"] = str(reg_str)
-                pt_info["valid_refs"].update(
-                    {
-                        str(reg_str),
-                        f"4{int(reg_str):04d}" if str(reg_str).isdigit() and int(reg_str) < 10000 else str(reg_str),
-                        f"{reg_str}.{spec.get('format', '')}",
-                    }
-                )
-                if dbo_name not in record["points"]:
-                    record["points"][dbo_name] = {
-                        "present_value": None,
-                        "hardware_error": None,
-                    }
+                fmt = str(spec.get("format", "")).lower()
+                record["known_points"][dbo_name] = {
+                    "register": int(reg_str),
+                    "num_registers": int(spec.get("number_of_registers", 1)),
+                    "format": fmt,
+                    "modbus_type": "ASCII" if fmt.startswith("str") else _FORMAT_TO_MODBUS_TYPE.get(fmt),
+                    "units": spec.get("units"),
+                }
+                record["points"][dbo_name] = self._new_point_slot()
+
+            # Until the first config arrives, report the points the site model expects.
+            meta_points = ((metadata.get("pointset") or {}).get("points")) or {}
+            if isinstance(meta_points, dict):
+                record["configured_points"] = {
+                    str(name): dict(spec) if isinstance(spec, dict) else {}
+                    for name, spec in meta_points.items()
+                }
+            self._refresh_health_locked(record, time.monotonic())
 
             self.devices[slave_key] = record
             self.devices_by_id[device_id] = record
             return True
+
+    @staticmethod
+    def _new_point_slot() -> dict:
+        return {
+            "present_value": None,
+            "updated_mono": None,
+            "unavailable": False,
+            "unavailable_mono": None,
+            "error": None,
+            "error_mono": None,
+        }
 
     def _resolve_device_locked(self, identifier) -> dict:
         key = str(identifier)
@@ -641,164 +743,343 @@ class UDMIHandler:
         if int(entry["level"]) >= int(dev["min_loglevel"]):
             dev["pending_logs"].append(entry)
 
-    def _is_valid_point_ref(self, dev: dict, point_name: str, ref_value) -> bool:
-        if ref_value is None:
-            return True
-        ref_str = str(ref_value).strip()
-        if not ref_str:
-            return True
-        pt_info = dev["known_points"].get(point_name)
-        if not pt_info:
-            return False
-        valid_refs = pt_info.get("valid_refs") or set()
-        if ref_str in valid_refs:
-            return True
-
-        # Support UDMI 1.5 Modbus protocol refs:
-        # [modbus://<addr>/][<unitid>/]<function>/<address>[/<quantity>][?<params>]
-        match = _MODBUS_UDMI_REF_RE.match(ref_str)
-        if match:
-            unit_id, func_code, reg_addr, _qty, query = match.groups()
-            expected_slave = str(dev.get("modbus_slave_id") or "")
-            if unit_id is not None and expected_slave and unit_id != expected_slave:
-                return False
-            if func_code not in _MODBUS_ALLOWED_FCS:
-                return False
-            expected_reg = pt_info.get("register")
-            if expected_reg is not None and reg_addr != str(expected_reg):
-                return False
-            if query:
-                for param in query.split("&"):
-                    if "=" not in param:
-                        return False
-                    key, val = param.split("=", 1)
-                    if key not in _MODBUS_ALLOWED_PARAMS or not val:
-                        return False
-            return True
-
-        if not valid_refs:
-            return ref_str.isdigit()
-        return False
-
-    def set_modbus_poll_error(self, modbus_slave_id, error_message: str):
-        """Record or clear a fieldbus communication error on a proxied Modbus device."""
+    def get_meter_types(self) -> dict:
+        """Return {modbus_slave_id (int): meter type} for all registered proxied devices."""
         with self._lock:
-            dev = self.devices.get(str(modbus_slave_id))
-            if not dev:
+            return {int(slave): dev["device_type"] for slave, dev in self.devices.items()}
+
+    # --------------------------------------------------------------- point refs
+
+    def _check_point_ref_locked(self, dev: dict, point_name: str, ref_value):
+        """Return None if `ref_value` describes exactly what this gateway reads, else a reason."""
+        pt_info = dev["known_points"].get(point_name)
+        if pt_info is None:
+            return "point is not provided by this device"
+        try:
+            parsed = parse_modbus_ref(ref_value, unit_from_context=dev.get("unit_in_context", False))
+        except ValueError as exc:
+            return f"invalid modbus ref '{ref_value}': {exc}"
+
+        if parsed["legacy"]:
+            if parsed["address"] != pt_info["register"]:
+                return f"register {parsed['address']} does not match point register {pt_info['register']}"
+            return None
+        if parsed["unitid"] is not None and parsed["unitid"] != dev.get("slave_id_int"):
+            return f"unit id {parsed['unitid']} does not match modbus_slave_id {dev.get('slave_id_int')}"
+        if parsed["addr"] is not None and parsed["addr"] not in dev.get("valid_target_addrs", ()):
+            return f"modbus address '{parsed['addr']}' is not how this gateway reaches the device"
+        if parsed["fc"] not in _MODBUS_READ_FCS:
+            return f"function code {parsed['fc']} is not supported (FC03/FC04 reads only)"
+        if parsed["address"] != pt_info["register"]:
+            return f"register {parsed['address']} does not match point register {pt_info['register']}"
+        if parsed["quantity"] is not None and parsed["quantity"] != pt_info["num_registers"]:
+            return f"quantity {parsed['quantity']} does not match {pt_info['num_registers']} registers"
+        params = parsed["params"]
+        if "type" in params and params["type"] != pt_info["modbus_type"]:
+            return f"type {params['type']} does not match register type {pt_info['modbus_type']}"
+        if params.get("worder", "HWF") != "HWF":
+            return "word order LWF is not supported (registers are decoded high word first)"
+        if params.get("border", "MSB") != "MSB":
+            return "byte order LSB is not supported"
+        if float(params.get("scale", 1.0)) != 1.0 or float(params.get("offset", 0.0)) != 0.0:
+            return "scale/offset interpretation is not supported"
+        return None
+
+    def _canonical_point_ref(self, dev: dict, pt_info: dict) -> str:
+        base = f"3/{pt_info['register']}/{pt_info['num_registers']}"
+        if not dev.get("unit_in_context"):
+            base = f"{dev.get('slave_id_int')}/{base}"
+        if pt_info.get("modbus_type"):
+            base += f"?type={pt_info['modbus_type']}"
+        return base
+
+    # ------------------------------------------------------------ Modbus input
+
+    def record_modbus_payload(self, payload: dict, now_mono: float = None):
+        """Apply one decoded MXcloudgate frame (see modbus_to_json) to the proxied device."""
+        if not isinstance(payload, dict):
+            return
+        slave_key = str(payload.get("slave_id"))
+        with self._lock:
+            dev = self.devices.get(slave_key)
+            if dev is None:
                 return
-            if error_message:
-                # Only update gateway_status if not already holding a config target error
-                current_cat = (dev.get("gateway_status") or {}).get("category")
-                if current_cat != CATEGORY_GATEWAY_PROXY_TARGET:
-                    new_status = self.make_entry(
-                        CATEGORY_GATEWAY_PROXY_CONNECT,
-                        LEVEL_ERROR,
-                        f"Modbus poll error: {error_message}",
-                    )
-                    if current_cat != CATEGORY_GATEWAY_PROXY_CONNECT:
-                        dev["gateway_status"] = new_status
-                        self._refresh_dirty_flag_locked(dev)
-            else:
-                current_cat = (dev.get("gateway_status") or {}).get("category")
-                if current_cat == CATEGORY_GATEWAY_PROXY_CONNECT:
-                    dev["gateway_status"] = None
-                    self._refresh_dirty_flag_locked(dev)
+            now = time.monotonic() if now_mono is None else now_mono
+            error = payload.get("error")
+            if error:
+                dev["last_error"] = str(error)
+                self._log_throttled(
+                    ("modbus_error", slave_key, str(error)),
+                    self.logger.warning,
+                    f"{dev['device_id']} (unit {slave_key}): {error}",
+                )
+                if (
+                    payload.get("error_kind") == ERROR_EXCEPTION
+                    and payload.get("exception_code") in PERSISTENT_EXCEPTION_CODES
+                ):
+                    start = payload.get("start_register")
+                    qty = payload.get("quantity")
+                    if isinstance(start, int) and isinstance(qty, int) and qty > 0:
+                        end = start + qty - 1
+                        for name, info in dev["known_points"].items():
+                            first = info["register"]
+                            last = first + info["num_registers"] - 1
+                            if first <= end and last >= start:
+                                slot = dev["points"][name]
+                                slot["error"] = f"{error} for registers {start}-{end}"
+                                slot["error_mono"] = now
+                self._refresh_health_locked(dev, now)
+                return
+
+            dev["last_rx_mono"] = now
+            data = payload.get("data") or {}
+            sys_map = (self._modbus_dbo_map.get(dev["device_type"]) or {}).get("system") or {}
+            meter_map = self._modbus_dbo_map.get(dev["device_type"]) or {}
+            for reg, value in data.items():
+                reg_key = str(reg)
+                if reg_key in meter_map and reg_key != "system":
+                    self._apply_point_value_locked(dev, meter_map[reg_key].get("dbo_name"), value, now)
+                elif reg_key in sys_map:
+                    self._update_system_info_locked(dev, sys_map[reg_key], value)
+            for reg in (payload.get("unavailable") or {}):
+                reg_key = str(reg)
+                if reg_key in meter_map and reg_key != "system":
+                    slot = dev["points"].get(meter_map[reg_key].get("dbo_name"))
+                    if slot is not None:
+                        slot["unavailable"] = True
+                        slot["unavailable_mono"] = now
+            self._refresh_health_locked(dev, now)
 
     def update_device_properties(self, modbus_slave_id, device_type, registry_number, value):
-        """
-        Update a proxied device's point telemetry or system metadata from a decoded Modbus register.
-        """
-        if value is None or isinstance(value, bool):
+        """Backward-compatible single-register update (value=None marks "not available")."""
+        payload = {"slave_id": modbus_slave_id, "data": {}, "unavailable": {}}
+        if value is None:
+            payload["unavailable"][str(registry_number)] = "N/A"
+        elif isinstance(value, bool):
             return
-        if isinstance(value, str):
-            # Reject legacy error/NaN strings for point values
-            if value.startswith("[ERROR]") or value.startswith("N/A(") or value == "":
-                return
-
-        reg_key = str(registry_number)
-        slave_key = str(modbus_slave_id)
-
+        else:
+            payload["data"][str(registry_number)] = value
         with self._lock:
-            if device_type not in self._modbus_dbo_map:
-                self.logger.error(
-                    f"Modbus-to-DBO map is not defined for '{device_type}'."
-                )
+            dev = self.devices.get(str(modbus_slave_id))
+            if dev is None or dev.get("device_type") != str(device_type):
                 return
+        self.record_modbus_payload(payload)
 
-            dev = self.devices.get(slave_key)
-            if not dev:
-                return
+    def _apply_point_value_locked(self, dev: dict, point_name, value, now: float):
+        if not point_name or point_name not in dev["points"]:
+            return
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            return
+        slot = dev["points"][point_name]
+        slot["present_value"] = value
+        slot["updated_mono"] = now
+        slot["unavailable"] = False
+        slot["error"] = None
 
-            # Clear any transient Modbus connect error upon valid data reception
-            if (dev.get("gateway_status") or {}).get("category") == CATEGORY_GATEWAY_PROXY_CONNECT:
-                dev["gateway_status"] = None
-
-            meter_map = self._modbus_dbo_map[device_type]
-            if reg_key in meter_map and reg_key != "system":
-                self._update_device_points_present_value_locked(dev, meter_map, reg_key, value)
-            elif "system" in meter_map and reg_key in meter_map["system"]:
-                self._update_system_info_locked(dev, meter_map["system"], reg_key, value)
-
-    def _update_system_info_locked(self, dev: dict, sys_map: dict, reg_key: str, value):
-        point = sys_map[reg_key].get("dbo_name")
+    def _update_system_info_locked(self, dev: dict, sys_spec: dict, value):
+        point = sys_spec.get("dbo_name")
         str_val = str(value).strip()
         if not str_val:
             return
+        if point == "serial_no":
+            if dev["configured_serial"] and dev["configured_serial"] != str_val:
+                self._log_throttled(
+                    ("serial_mismatch", dev["device_id"]),
+                    self.logger.warning,
+                    f"{dev['device_id']}: meter reports serial '{str_val}' but configuration says "
+                    f"'{dev['configured_serial']}'; reporting the meter value",
+                    interval_sec=3600.0,
+                )
+            dev["serial_no"] = str_val
+        elif point in ("firmware_version", "version"):
+            dev["software"]["firmware"] = str_val
+        elif point == "manufacturer_name":
+            dev["hardware"]["make"] = str_val
+        elif point == "model_name":
+            dev["hardware"]["model"] = str_val
 
+    # ------------------------------------------------------------ health/state
+
+    def _point_health_locked(self, dev: dict, point_name: str, now: float):
+        slot = dev["points"].get(point_name) or self._new_point_slot()
+        updated = slot["updated_mono"]
+        if slot["unavailable"] and (updated is None or slot["unavailable_mono"] >= updated):
+            return "failure", "Meter reports the value as not available"
+        if slot["error"] and (updated is None or slot["error_mono"] >= updated):
+            return "failure", slot["error"]
+        stale_desc = f"{int(self.stale_timeout_sec)} s"
+        if updated is None:
+            if now - self._start_mono < self.stale_timeout_sec:
+                return "initializing", None
+            return "failure", f"No Modbus reading received within {stale_desc}"
+        if now - updated > self.stale_timeout_sec:
+            return "failure", f"No fresh Modbus reading within {stale_desc}"
+        return "ok", None
+
+    def _evaluate_point_locked(self, dev: dict, point_name: str, pt_cfg, now: float):
+        if point_name not in dev["known_points"]:
+            return "invalid", (
+                CATEGORY_POINTSET_POINT_INVALID,
+                LEVEL_ERROR,
+                f"Point {point_name} is not provided by this device",
+            )
+        pt_cfg = pt_cfg if isinstance(pt_cfg, dict) else {}
+        if pt_cfg.get("set_value") is not None:
+            return "invalid", (
+                CATEGORY_POINTSET_POINT_INVALID,
+                LEVEL_ERROR,
+                f"Point {point_name} is read-only; set_value is not supported",
+            )
+        ref_val = pt_cfg.get("ref")
+        if ref_val is not None and str(ref_val).strip():
+            reason = self._check_point_ref_locked(dev, point_name, ref_val)
+            if reason:
+                return "failure", (
+                    CATEGORY_POINTSET_POINT_FAILURE,
+                    LEVEL_ERROR,
+                    f"Point {point_name}: {reason}",
+                )
+        health, message = self._point_health_locked(dev, point_name, now)
+        if health == "failure":
+            return "failure", (CATEGORY_POINTSET_POINT_FAILURE, LEVEL_ERROR, f"Point {point_name}: {message}")
+        if health == "initializing":
+            return "initializing", None
+        return None, None
+
+    def _connect_sig_locked(self, dev: dict, now: float):
+        reference = dev["last_rx_mono"] if dev["last_rx_mono"] is not None else self._start_mono
+        if now - reference <= self.stale_timeout_sec:
+            return None
+        message = (
+            f"No valid Modbus response from unit {dev['modbus_slave_id']} "
+            f"for more than {int(self.stale_timeout_sec)} s"
+        )
+        if dev["last_error"]:
+            message += f" (last error: {dev['last_error']})"
+        return (CATEGORY_GATEWAY_PROXY_CONNECT, LEVEL_ERROR, message)
+
+    def _refresh_health_locked(self, dev: dict, now: float) -> bool:
+        """Re-evaluate point/connect health; status timestamps only change on transitions."""
         changed = False
-        if point == "serial_no" and not dev["serial_pinned"]:
-            if dev["serial_no"] != str_val:
-                dev["serial_no"] = str_val
+        if not dev["is_gateway"]:
+            sig = self._connect_sig_locked(dev, now)
+            if sig != dev["connect_sig"]:
+                dev["connect_sig"] = sig
+                dev["connect_status"] = self.make_entry(*sig) if sig else None
+                dev["operational"] = sig is None
                 changed = True
-        elif point in ("firmware_version", "version") and not dev["software_pinned"]:
-            if dev["software"].get("firmware") != str_val:
-                dev["software"]["firmware"] = str_val
-                changed = True
-        elif point == "manufacturer_name" and not dev["hardware_pinned"]:
-            if dev["hardware"].get("make") != str_val:
-                dev["hardware"]["make"] = str_val
-                changed = True
-        elif point in ("model_name", "product_name") and not dev["hardware_pinned"]:
-            if point == "model_name" and dev["hardware"].get("model") != str_val:
-                dev["hardware"]["model"] = str_val
-                changed = True
+
+        new_sigs = {
+            name: self._evaluate_point_locked(dev, name, cfg, now)
+            for name, cfg in dev["configured_points"].items()
+        }
+        if new_sigs != dev["point_sigs"]:
+            entries = {}
+            for name, sig in new_sigs.items():
+                if dev["point_sigs"].get(name) == sig and name in dev["point_entries"]:
+                    entries[name] = dev["point_entries"][name]
+                    continue
+                value_state, status = sig
+                entry = {}
+                if value_state:
+                    entry["value_state"] = value_state
+                if status:
+                    entry["status"] = self.make_entry(*status)
+                entries[name] = entry
+            dev["point_sigs"] = new_sigs
+            dev["point_entries"] = entries
+            changed = True
 
         if changed:
             self._refresh_dirty_flag_locked(dev)
+        return changed
 
-    def _update_device_points_present_value_locked(self, dev: dict, meter_map: dict, reg_key: str, value):
-        if not isinstance(value, (int, float)):
+    def tick(self, now_mono: float = None):
+        """Periodic housekeeping: point freshness, proxy connectivity, gateway address changes."""
+        with self._lock:
+            now = time.monotonic() if now_mono is None else now_mono
+            if now - self._last_health_tick < HEALTH_TICK_SEC:
+                return
+            self._last_health_tick = now
+            for dev in self.devices_by_id.values():
+                self._refresh_health_locked(dev, now)
+            if now >= self._next_localnet_refresh:
+                self._next_localnet_refresh = now + LOCALNET_REFRESH_SEC
+                gw = self.devices_by_id.get(self.gateway_id)
+                if gw is not None:
+                    families = detect_host_network_families(
+                        preferred_interface=gw.get("preferred_interface"),
+                        metadata_localnet=(gw["metadata"] or {}).get("localnet"),
+                    )
+                    if families != gw["localnet_families"]:
+                        self.logger.info(f"Gateway network addresses changed: {families}")
+                        gw["localnet_families"] = families
+                        self._refresh_dirty_flag_locked(gw)
+
+    # ------------------------------------------------------------------ errors
+
+    def record_gateway_error(self, device_id, raw_payload):
+        """Surface a cloud `errors` topic message (e.g. failed proxy attach) in gateway status."""
+        with self._lock:
+            gw = self.devices_by_id.get(self.gateway_id)
+            if gw is None:
+                return
+            details = {}
+            try:
+                parsed = json.loads(raw_payload) if raw_payload else {}
+                if isinstance(parsed, dict):
+                    details = parsed
+            except (TypeError, ValueError):
+                pass
+            target = str(details.get("device_id") or device_id or self.gateway_id)
+            description = (
+                details.get("description")
+                or details.get("error_type")
+                or str(raw_payload or "")[:200]
+                or "unspecified error"
+            )
+            message = f"Cloud reported error for {target}: {description}"
+            previous = gw["attach_errors"].get(target)
+            entry = self.make_entry(CATEGORY_GATEWAY_SETUP_ATTACH, LEVEL_ERROR, message)
+            gw["attach_errors"][target] = entry
+            if previous is None or previous["message"] != message:
+                self._queue_log_locked(gw, entry)
+            self._log_throttled(("gateway_error", target), self.logger.error, message)
+            gw["attach_status"] = entry
+            self._refresh_dirty_flag_locked(gw)
+
+    def _note_proxy_config_received_locked(self, device_id: str):
+        gw = self.devices_by_id.get(self.gateway_id)
+        if gw is None or device_id not in gw["attach_errors"]:
             return
-        point = meter_map[reg_key]["dbo_name"]
-        pt_slot = dev["points"].setdefault(
-            point, {"present_value": None, "hardware_error": None}
-        )
-        was_unread = pt_slot["present_value"] is None
-        pt_slot["present_value"] = value
-        pt_slot["hardware_error"] = None
-        if was_unread and point in dev["configured_points"]:
-            self._refresh_dirty_flag_locked(dev)
+        del gw["attach_errors"][device_id]
+        remaining = list(gw["attach_errors"].values())
+        gw["attach_status"] = remaining[-1] if remaining else None
+        self._refresh_dirty_flag_locked(gw)
+
+    # ------------------------------------------------------------------ config
 
     def handle_config(self, device_id: str, raw_payload: str) -> bool:
         """
-        Process a downlink UDMI `config` MQTT payload for either the gateway or a proxied device.
-        Implements UDMI 1.5 config logging (`receive`, `parse`, `apply`), `broken_config` error
-        state reporting without advancing `last_config`, `extra_config` tolerance, `min_loglevel`,
-        subblock parity, dynamic `pointset`, and proxied `gateway.target` validation.
+        Process a downlink UDMI `config` for the gateway or a proxied device: config logging
+        (`receive`, `parse`, `apply`), broken config reporting without advancing `last_config`,
+        atomic apply, subblock parity, pointset/gateway/discovery handling and restart requests.
         """
         with self._lock:
             dev = self._resolve_device_locked(device_id)
             if dev is None:
                 self.logger.warning(f"Ignoring config for unregistered device '{device_id}'")
                 return False
+            now = time.monotonic()
+            if not dev["is_gateway"]:
+                self._note_proxy_config_received_locked(dev["device_id"])
 
             if raw_payload is None or len(raw_payload.strip()) == 0:
-                self.logger.info(f"Received empty initial config for '{device_id}'; using defaults")
+                self.logger.info(f"Received empty config for '{device_id}'; keeping defaults")
                 dev["has_received_config"] = True
                 self._refresh_dirty_flag_locked(dev)
                 return True
 
-            # Phase 1: RECEIVE (evaluated against current pre-apply min_loglevel)
             self._queue_log_locked(
                 dev,
                 self.make_entry(
@@ -808,27 +1089,12 @@ class UDMIHandler:
                 ),
             )
 
-            # Phase 2: PARSE
             try:
                 config = json.loads(raw_payload)
                 if not isinstance(config, dict):
                     raise ValueError("Top-level config JSON must be an object")
-            except Exception as exc:
-                parse_err = self.make_entry(
-                    CATEGORY_SYSTEM_CONFIG_PARSE,
-                    LEVEL_ERROR,
-                    f"Config JSON parse error: {exc}",
-                    detail=repr(exc),
-                )
-                self._queue_log_locked(dev, parse_err)
-                dev["system_status"] = {
-                    "category": CATEGORY_SYSTEM_CONFIG_PARSE,
-                    "level": LEVEL_ERROR,
-                    "message": parse_err["message"],
-                    "timestamp": parse_err["timestamp"],
-                }
-                dev["has_received_config"] = True
-                self._refresh_dirty_flag_locked(dev, force_dirty=True)
+            except ValueError as exc:
+                self._record_config_failure_locked(dev, CATEGORY_SYSTEM_CONFIG_PARSE, "Config JSON parse error", exc)
                 return False
 
             self._queue_log_locked(
@@ -840,28 +1106,21 @@ class UDMIHandler:
                 ),
             )
 
-            # Phase 3: APPLY
+            # Apply on a copy so that a failing config leaves the device untouched.
+            staged = copy.deepcopy(dev)
             try:
-                self._apply_parsed_config_locked(dev, config)
-            except Exception as exc:
-                apply_err = self.make_entry(
-                    CATEGORY_SYSTEM_CONFIG_APPLY,
-                    LEVEL_ERROR,
-                    f"Config apply error: {exc}",
-                    detail=repr(exc),
-                )
-                self._queue_log_locked(dev, apply_err)
-                dev["system_status"] = {
-                    "category": CATEGORY_SYSTEM_CONFIG_APPLY,
-                    "level": LEVEL_ERROR,
-                    "message": apply_err["message"],
-                    "timestamp": apply_err["timestamp"],
-                }
-                dev["has_received_config"] = True
-                self._refresh_dirty_flag_locked(dev, force_dirty=True)
+                warnings = self._apply_parsed_config_locked(staged, config)
+            except Exception as exc:  # noqa: BLE001 - any apply failure must be reported
+                self._record_config_failure_locked(dev, CATEGORY_SYSTEM_CONFIG_APPLY, "Config apply error", exc)
                 return False
+            dev.clear()
+            dev.update(staged)
 
-            # Log apply success evaluated against newly applied min_loglevel
+            for warning in warnings:
+                self._queue_log_locked(
+                    dev, self.make_entry(CATEGORY_SYSTEM_CONFIG_APPLY, LEVEL_WARNING, warning)
+                )
+                self.logger.warning(f"{device_id}: {warning}")
             self._queue_log_locked(
                 dev,
                 self.make_entry(
@@ -871,11 +1130,38 @@ class UDMIHandler:
                 ),
             )
             dev["has_received_config"] = True
+            self._refresh_health_locked(dev, now)
             self._refresh_dirty_flag_locked(dev)
+
+            if dev["is_gateway"] and dev.get("restart_requested") and not self._restart_requested:
+                self._restart_requested = True
+                self._queue_log_locked(
+                    dev,
+                    self.make_entry(
+                        CATEGORY_SYSTEM_BASE_SHUTDOWN,
+                        LEVEL_NOTICE,
+                        "Restarting gateway process (system.operation.mode=restart)",
+                    ),
+                )
             return True
 
-    def _apply_parsed_config_locked(self, dev: dict, config: dict):
-        # 1. Exact subblock parity with incoming config (`system` is always required in state)
+    def _record_config_failure_locked(self, dev: dict, category: str, prefix: str, exc: Exception):
+        entry = self.make_entry(category, LEVEL_ERROR, f"{prefix}: {exc}", detail=repr(exc))
+        self._queue_log_locked(dev, entry)
+        dev["system_status"] = {
+            "category": category,
+            "level": LEVEL_ERROR,
+            "message": entry["message"],
+            "timestamp": entry["timestamp"],
+        }
+        dev["has_received_config"] = True
+        self._refresh_dirty_flag_locked(dev, force_dirty=True)
+
+    def _apply_parsed_config_locked(self, dev: dict, config: dict) -> list:
+        """Apply a parsed config to `dev` (a staged copy). Returns warning messages."""
+        warnings = []
+
+        # 1. Subblock parity with the incoming config (`system` is always present in state)
         new_subblocks = {"system"}
         for block in UDMI_SUBBLOCKS:
             if config.get(block) is not None:
@@ -884,92 +1170,59 @@ class UDMIHandler:
 
         # 2. System subblock
         sys_cfg = config.get("system")
-        if isinstance(sys_cfg, dict):
-            min_lvl = sys_cfg.get("min_loglevel")
-            if isinstance(min_lvl, (int, float)) and not isinstance(min_lvl, bool):
-                dev["min_loglevel"] = int(min_lvl)
-            else:
-                dev["min_loglevel"] = LEVEL_INFO
-
-            metrics_rate = sys_cfg.get("metrics_rate_sec")
-            if isinstance(metrics_rate, (int, float)) and metrics_rate > 0:
-                dev["metrics_rate_sec"] = float(metrics_rate)
-                if dev["next_metrics_mono"] <= 0:
-                    dev["next_metrics_mono"] = time.monotonic() + dev["metrics_rate_sec"]
-            else:
-                dev["metrics_rate_sec"] = 0.0
-                dev["next_metrics_mono"] = 0.0
-
-            op_cfg = sys_cfg.get("operation")
-            req_mode = op_cfg.get("mode") if isinstance(op_cfg, dict) else None
-            if req_mode == "restart":
-                if not dev["restart_handled"]:
-                    dev["restart_handled"] = True
-                    dev["restart_count"] += 1
-                    dev["operation_mode"] = "initial"
-                    dev["last_start"] = self._next_start_iso_after(dev["last_start"])
-            else:
-                dev["restart_handled"] = False
-                if req_mode in ("active", None):
-                    dev["operation_mode"] = "active"
-                elif isinstance(req_mode, str) and req_mode:
-                    dev["operation_mode"] = req_mode
+        sys_cfg = sys_cfg if isinstance(sys_cfg, dict) else {}
+        min_lvl = sys_cfg.get("min_loglevel")
+        if isinstance(min_lvl, (int, float)) and not isinstance(min_lvl, bool):
+            dev["min_loglevel"] = int(min_lvl)
         else:
-            dev["min_loglevel"] = LEVEL_INFO
-            dev["restart_handled"] = False
-            dev["operation_mode"] = "active"
+            dev["min_loglevel"] = DEFAULT_MIN_LOGLEVEL
+
+        metrics_rate = sys_cfg.get("metrics_rate_sec")
+        if dev["is_gateway"] and isinstance(metrics_rate, (int, float)) and metrics_rate > 0:
+            dev["metrics_rate_sec"] = float(metrics_rate)
+            if dev["next_metrics_mono"] <= 0:
+                dev["next_metrics_mono"] = time.monotonic() + dev["metrics_rate_sec"]
+        else:
+            dev["metrics_rate_sec"] = 0.0
+            dev["next_metrics_mono"] = 0.0
+
+        op_cfg = sys_cfg.get("operation")
+        req_mode = op_cfg.get("mode") if isinstance(op_cfg, dict) else None
+        if dev["is_gateway"]:
+            if req_mode == MODE_RESTART:
+                # Like pubber: only an ACTIVE device restarts; after the restart the device stays
+                # INITIAL until the cloud sets the mode back to ACTIVE (prevents restart loops).
+                if dev["operation_mode"] == MODE_ACTIVE:
+                    dev["restart_requested"] = True
+            elif req_mode in (None, MODE_ACTIVE):
+                dev["operation_mode"] = MODE_ACTIVE
+            else:
+                warnings.append(f"system.operation.mode '{req_mode}' is not supported; ignored")
+        elif req_mode not in (None, MODE_ACTIVE):
+            warnings.append(
+                f"system.operation.mode '{req_mode}' is not supported for proxied devices; ignored"
+            )
 
         # 3. Gateway subblock
+        dev["target_status"] = None
         if "gateway" in new_subblocks:
-            gw_cfg = config.get("gateway") or {}
+            gw_cfg = config.get("gateway")
+            gw_cfg = gw_cfg if isinstance(gw_cfg, dict) else {}
             if dev["is_gateway"]:
                 proxy_ids = gw_cfg.get("proxy_ids")
                 if isinstance(proxy_ids, list):
                     dev["configured_proxy_ids"] = [str(p) for p in proxy_ids]
-                dev["gateway_status"] = None
             else:
                 target = gw_cfg.get("target")
                 if isinstance(target, dict) and target:
-                    fam = target.get("family")
-                    addr = target.get("addr")
-                    unit_id = target.get("unitid")
-                    expected_slave = str(dev.get("modbus_slave_id") or "")
-                    if fam is not None and str(fam) not in dev["valid_target_families"]:
-                        dev["gateway_status"] = self.make_entry(
-                            CATEGORY_GATEWAY_PROXY_TARGET,
-                            LEVEL_ERROR,
-                            f"Unsupported gateway target family '{fam}'",
-                        )
-                    elif addr is not None and str(addr) not in dev["valid_target_addrs"]:
-                        dev["gateway_status"] = self.make_entry(
-                            CATEGORY_GATEWAY_PROXY_TARGET,
-                            LEVEL_ERROR,
-                            f"Invalid gateway target address '{addr}'",
-                        )
-                    elif unit_id is not None and expected_slave and str(unit_id) != expected_slave:
-                        dev["gateway_status"] = self.make_entry(
-                            CATEGORY_GATEWAY_PROXY_TARGET,
-                            LEVEL_ERROR,
-                            f"Invalid gateway target unitid '{unit_id}'",
-                        )
-                    else:
-                        dev["gateway_status"] = None
-                else:
-                    dev["gateway_status"] = None
-        else:
-            dev["gateway_status"] = None
+                    dev["target_status"] = self._validate_target(dev, target)
 
-        # 4. Localnet subblock
-        if "localnet" in new_subblocks:
-            ln_cfg = config.get("localnet") or {}
-            cfg_families = ln_cfg.get("families")
-            if isinstance(cfg_families, dict):
-                for fam_name in cfg_families:
-                    dev["localnet_families"].setdefault(fam_name, {})
+        # 4. Localnet subblock: parity only; addresses are always detected, never taken from config.
 
         # 5. Pointset subblock
         if "pointset" in new_subblocks:
-            ps_cfg = config.get("pointset") or {}
+            ps_cfg = config.get("pointset")
+            ps_cfg = ps_cfg if isinstance(ps_cfg, dict) else {}
             new_interval = self._compute_sample_interval(
                 ps_cfg.get("sample_rate_sec"),
                 ps_cfg.get("sample_limit_sec"),
@@ -982,44 +1235,83 @@ class UDMIHandler:
             elif dev["next_pointset_mono"] > now_mono + new_interval:
                 dev["next_pointset_mono"] = now_mono + min(1.0, new_interval)
 
-            if "points" in ps_cfg and isinstance(ps_cfg["points"], dict):
-                new_cfg_points = {}
+            new_cfg_points = {}
+            if isinstance(ps_cfg.get("points"), dict):
                 for pt_name, pt_spec in ps_cfg["points"].items():
                     new_cfg_points[str(pt_name)] = dict(pt_spec) if isinstance(pt_spec, dict) else {}
-            else:
-                new_cfg_points = {}
-
-            points_changed = new_cfg_points != dev["configured_points"]
-            dev["configured_points"] = new_cfg_points
-            if points_changed:
+            if new_cfg_points != dev["configured_points"]:
                 dev["next_pointset_mono"] = min(
                     dev["next_pointset_mono"], now_mono + min(1.5, new_interval)
                 )
+            dev["configured_points"] = new_cfg_points
+        else:
+            dev["configured_points"] = {}
 
         # 6. Discovery subblock (self-enumeration)
-        if "discovery" in new_subblocks:
-            disc_cfg = config.get("discovery") or {}
-            gen = disc_cfg.get("generation") if isinstance(disc_cfg, dict) else None
-            if gen is not None:
-                gen_str = str(gen)
-                if gen_str != dev["discovery_generation"]:
-                    dev["discovery_generation"] = gen_str
-                    enumerations = disc_cfg.get("enumerations")
-                    if not isinstance(enumerations, dict):
-                        enumerations = {}
-                    disc_event = self._build_self_enumeration_event_locked(
-                        dev, gen_str, enumerations
-                    )
-                    dev["pending_discovery_events"].append(disc_event)
-            else:
-                dev["discovery_generation"] = None
+        disc_cfg = config.get("discovery") if "discovery" in new_subblocks else None
+        gen = disc_cfg.get("generation") if isinstance(disc_cfg, dict) else None
+        if gen is not None:
+            gen_str = str(gen)
+            if gen_str != dev["discovery_generation"]:
+                dev["discovery_generation"] = gen_str
+                enumerations = disc_cfg.get("enumerations")
+                if not isinstance(enumerations, dict):
+                    enumerations = {}
+                dev["pending_discovery_events"].append(
+                    self._build_self_enumeration_event_locked(dev, gen_str, enumerations)
+                )
         else:
             dev["discovery_generation"] = None
 
-        # 7. Update last_config and clear system_status on clean apply
+        # 7. Blobset subblock: blob updates are not implemented, so say so explicitly.
+        dev["blob_states"] = {}
+        blob_cfg = config.get("blobset")
+        blobs = blob_cfg.get("blobs") if isinstance(blob_cfg, dict) else None
+        if isinstance(blobs, dict):
+            for blob_id, blob_spec in blobs.items():
+                blob_state = {
+                    "phase": "final",
+                    "status": self.make_entry(
+                        CATEGORY_BLOBSET_BLOB_APPLY,
+                        LEVEL_ERROR,
+                        f"Blob '{blob_id}' updates are not supported by this device",
+                    ),
+                }
+                if isinstance(blob_spec, dict) and blob_spec.get("generation"):
+                    blob_state["generation"] = str(blob_spec["generation"])
+                dev["blob_states"][str(blob_id)] = blob_state
+
+        # 8. last_config and system status
         if config.get("timestamp"):
             dev["last_config"] = str(config["timestamp"])
+        else:
+            warnings.append("Config has no timestamp; last_config not updated")
         dev["system_status"] = None
+        return warnings
+
+    def _validate_target(self, dev: dict, target: dict):
+        fam = target.get("family")
+        addr = target.get("addr")
+        unit_id = target.get("unitid")
+        if fam is not None and str(fam) not in dev["valid_target_families"]:
+            return self.make_entry(
+                CATEGORY_GATEWAY_PROXY_TARGET,
+                LEVEL_ERROR,
+                f"Unsupported gateway target family '{fam}' (this gateway proxies modbus only)",
+            )
+        if addr is not None and str(addr) not in dev["valid_target_addrs"]:
+            return self.make_entry(
+                CATEGORY_GATEWAY_PROXY_TARGET,
+                LEVEL_ERROR,
+                f"Gateway target address '{addr}' is not how this gateway reaches the device",
+            )
+        if unit_id is not None and str(unit_id) != dev["modbus_slave_id"]:
+            return self.make_entry(
+                CATEGORY_GATEWAY_PROXY_TARGET,
+                LEVEL_ERROR,
+                f"Gateway target unitid '{unit_id}' does not match modbus_slave_id {dev['modbus_slave_id']}",
+            )
+        return None
 
     @staticmethod
     def _compute_sample_interval(sample_rate_sec, sample_limit_sec, default_sec: float) -> float:
@@ -1047,64 +1339,30 @@ class UDMIHandler:
             return max(limit, default_sec)
         return default_sec
 
-    def _build_point_state_entry_locked(self, dev: dict, pt_name: str, pt_cfg: dict) -> dict:
-        if pt_name not in dev["known_points"]:
-            return {
-                "value_state": "invalid",
-                "status": self.make_entry(
-                    CATEGORY_POINTSET_POINT_INVALID,
-                    LEVEL_ERROR,
-                    f"Unknown configured point {pt_name}",
-                ),
-            }
+    # ------------------------------------------------------------ state output
 
-        ref_val = (pt_cfg or {}).get("ref")
-        if ref_val is not None and not self._is_valid_point_ref(dev, pt_name, ref_val):
-            return {
-                "value_state": "failure",
-                "status": self.make_entry(
-                    CATEGORY_POINTSET_POINT_FAILURE,
-                    LEVEL_ERROR,
-                    f"Invalid point ref '{ref_val}' for point {pt_name}",
-                ),
-            }
-
-        pt_slot = dev["points"].get(pt_name) or {}
-        if pt_slot.get("hardware_error"):
-            return {
-                "value_state": "failure",
-                "status": self.make_entry(
-                    CATEGORY_POINTSET_POINT_FAILURE,
-                    LEVEL_ERROR,
-                    str(pt_slot["hardware_error"]),
-                ),
-            }
-
-        if not dev["is_gateway"] and pt_slot.get("present_value") is None:
-            return {
-                "value_state": "failure",
-                "status": self.make_entry(
-                    CATEGORY_POINTSET_POINT_FAILURE,
-                    LEVEL_ERROR,
-                    f"No Modbus reading received for point {pt_name}",
-                ),
-            }
-
-        return {}
+    def _gateway_status_locked(self, dev: dict):
+        if dev["is_gateway"]:
+            return dev["attach_status"]
+        return dev["target_status"] or dev["setup_status"] or dev["connect_status"]
 
     def _build_state_body_locked(self, dev: dict) -> dict:
         """Build UDMI 1.5 state dict without top-level timestamp (used for diffing & serialization)."""
+        operation = {"operational": bool(dev["operational"])}
+        if dev["is_gateway"]:
+            operation.update(
+                {
+                    "last_start": str(dev["last_start"]),
+                    "restart_count": int(dev["restart_count"]),
+                    "mode": str(dev["operation_mode"]),
+                }
+            )
         system_block = {
             "hardware": copy.deepcopy(dev["hardware"]),
             "software": copy.deepcopy(dev["software"]),
             "serial_no": str(dev["serial_no"]),
             "last_config": str(dev["last_config"]),
-            "operation": {
-                "operational": bool(dev["operational"]),
-                "last_start": str(dev["last_start"]),
-                "restart_count": int(dev["restart_count"]),
-                "mode": str(dev["operation_mode"]),
-            },
+            "operation": operation,
         }
         if dev.get("system_status") is not None:
             system_block["status"] = copy.deepcopy(dev["system_status"])
@@ -1117,20 +1375,21 @@ class UDMIHandler:
         subblocks = dev["active_subblocks"]
         if "gateway" in subblocks:
             gw_block = {}
-            if dev.get("gateway_status") is not None:
-                gw_block["status"] = copy.deepcopy(dev["gateway_status"])
+            status = self._gateway_status_locked(dev)
+            if status is not None:
+                gw_block["status"] = copy.deepcopy(status)
             state["gateway"] = gw_block
 
         if "localnet" in subblocks:
-            state["localnet"] = {
-                "families": copy.deepcopy(dev["localnet_families"]),
-            }
+            state["localnet"] = {"families": copy.deepcopy(dev["localnet_families"])}
 
         if "pointset" in subblocks:
-            points_state = {}
-            for pt_name, pt_cfg in dev["configured_points"].items():
-                points_state[pt_name] = self._build_point_state_entry_locked(dev, pt_name, pt_cfg)
-            state["pointset"] = {"points": points_state}
+            state["pointset"] = {
+                "points": {
+                    name: copy.deepcopy(dev["point_entries"].get(name, {}))
+                    for name in dev["configured_points"]
+                }
+            }
 
         if "discovery" in subblocks:
             disc_block = {"families": {}}
@@ -1138,16 +1397,14 @@ class UDMIHandler:
                 disc_block["generation"] = str(dev["discovery_generation"])
             state["discovery"] = disc_block
         if "blobset" in subblocks:
-            state["blobset"] = {"blobs": {}}
+            state["blobset"] = {"blobs": copy.deepcopy(dev["blob_states"])}
         if "alarmset" in subblocks:
             state["alarmset"] = {"alarms": {}}
 
         return state
 
-    def _build_self_enumeration_event_locked(
-        self, dev: dict, generation: str, enumerations: dict
-    ) -> dict:
-        """Build a UDMI 1.5 `events/discovery` self-enumeration payload."""
+    def _build_self_enumeration_event_locked(self, dev: dict, generation: str, enumerations: dict) -> dict:
+        """Build a UDMI 1.5 `events/discovery` self-enumeration payload from device knowledge."""
         event = {
             "version": UDMI_VERSION,
             "timestamp": self.get_timestamp(),
@@ -1172,20 +1429,13 @@ class UDMIHandler:
         pts_depth = enumerations.get("points")
         if pts_depth in ("entries", "details"):
             use_details = pts_depth == "details"
-            point_names = (
-                dev["enumerable_points"]
-                if dev.get("enumerable_points") is not None
-                else list(dev["known_points"].keys())
-            )
             points_out = {}
-            for pt_name in point_names:
-                pt_info = dev["known_points"].get(pt_name) or {}
+            for pt_name, pt_info in dev["known_points"].items():
                 pt_entry = {}
-                if use_details and isinstance(pt_info, dict):
+                if use_details:
                     if pt_info.get("units"):
                         pt_entry["units"] = str(pt_info["units"])
-                    if pt_info.get("register"):
-                        pt_entry["ref"] = str(pt_info["register"])
+                    pt_entry["ref"] = self._canonical_point_ref(dev, pt_info)
                 points_out[pt_name] = pt_entry
             event["points"] = points_out
 
@@ -1203,7 +1453,7 @@ class UDMIHandler:
 
     @staticmethod
     def _canonicalize_state_for_diff(state_body: dict) -> str:
-        """Canonicalize state while ignoring inner status entry timestamps so identical errors don't spam state."""
+        """Canonicalize state while ignoring inner status entry timestamps."""
         normalized = copy.deepcopy(state_body)
 
         def _strip_entry_ts(obj):
@@ -1221,17 +1471,23 @@ class UDMIHandler:
 
     def _refresh_dirty_flag_locked(self, dev: dict, force_dirty: bool = False):
         if force_dirty:
-            dev["state_dirty"] = True
-            return
-        body = self._build_state_body_locked(dev)
-        canonical = self._canonicalize_state_for_diff(body)
-        if canonical != dev["last_published_state_canonical"]:
-            dev["state_dirty"] = True
+            dev["force_state"] = True
+        canonical = self._canonicalize_state_for_diff(self._build_state_body_locked(dev))
+        dev["state_dirty"] = bool(
+            dev["force_state"] or canonical != dev["last_published_state_canonical"]
+        )
 
-    def get_state_payload(self, identifier) -> str:
+    def force_republish_all(self):
+        """Mark every device's state for re-publication (e.g. after an MQTT (re)connect)."""
+        with self._lock:
+            for dev in self.devices_by_id.values():
+                dev["force_state"] = True
+                dev["state_dirty"] = True
+
+    def get_state_payload(self, identifier, now_mono: float = None) -> str:
         """
         Unconditionally build and serialize a UDMI 1.5 `state` JSON payload for `identifier`
-        (accepts either `device_id` or `modbus_slave_id` for backward compatibility).
+        (device_id or modbus_slave_id) and record it as published.
         """
         with self._lock:
             dev = self._resolve_device_locked(identifier)
@@ -1241,53 +1497,60 @@ class UDMIHandler:
             canonical = self._canonicalize_state_for_diff(state_body)
             state_body["timestamp"] = self.get_timestamp()
             dev["last_published_state_canonical"] = canonical
-            dev["last_state_publish_mono"] = time.monotonic()
+            dev["last_state_publish_mono"] = time.monotonic() if now_mono is None else now_mono
             dev["state_dirty"] = False
+            dev["force_state"] = False
             return json.dumps(state_body)
 
     def pop_due_state_payload(self, device_id: str, now_mono: float = None):
         """
-        Return serialized `state` JSON if `device_id` has dirty state, has received its initial
-        config (or passed the startup wait timeout), and satisfies the 2s state throttle.
+        Return serialized `state` JSON if `device_id` has changed (or force-flagged) state, has
+        received its initial config (or passed the startup wait), and satisfies the state throttle.
+        Call `state_publish_failed()` if the payload could not be handed to MQTT.
         """
         with self._lock:
             dev = self._resolve_device_locked(device_id)
             if dev is None or not dev["state_dirty"]:
                 return None
-            if now_mono is None:
-                now_mono = time.monotonic()
+            now = time.monotonic() if now_mono is None else now_mono
 
             if not dev["has_received_config"]:
-                if (now_mono - dev["created_mono"]) < self.config_wait_timeout_sec:
+                if (now - dev["created_mono"]) < self.config_wait_timeout_sec:
                     return None
 
-            if dev["last_state_publish_mono"] > 0 and (
-                now_mono - dev["last_state_publish_mono"]
-            ) < STATE_THROTTLE_SEC:
+            last = dev["last_state_publish_mono"]
+            if last is not None and (now - last) < STATE_THROTTLE_SEC:
                 return None
 
-            return self.get_state_payload(dev["device_id"])
+            canonical = self._canonicalize_state_for_diff(self._build_state_body_locked(dev))
+            if not dev["force_state"] and canonical == dev["last_published_state_canonical"]:
+                dev["state_dirty"] = False
+                return None
+            return self.get_state_payload(dev["device_id"], now_mono=now)
+
+    def state_publish_failed(self, device_id: str):
+        """The last state payload was not accepted by the MQTT client: publish it again later."""
+        with self._lock:
+            dev = self._resolve_device_locked(device_id)
+            if dev is None:
+                return
+            dev["last_published_state_canonical"] = None
+            dev["state_dirty"] = True
 
     def pop_due_system_event_payload(self, device_id: str, now_mono: float = None):
-        """
-        Return serialized `events/system` JSON if `device_id` has queued log entries
-        or if periodic host metrics are due.
-        """
+        """Return serialized `events/system` JSON if logs are queued or host metrics are due."""
         with self._lock:
             dev = self._resolve_device_locked(device_id)
             if dev is None:
                 return None
-            if now_mono is None:
-                now_mono = time.monotonic()
+            now = time.monotonic() if now_mono is None else now_mono
 
             metrics_due = (
                 dev["is_gateway"]
                 and dev["metrics_rate_sec"] > 0
-                and now_mono >= dev["next_metrics_mono"]
+                and now >= dev["next_metrics_mono"]
             )
-            has_logs = len(dev["pending_logs"]) > 0
-
-            if not has_logs and not metrics_due:
+            if not dev["pending_logs"] and not metrics_due:
                 return None
 
             flushed_logs = list(dev["pending_logs"])
@@ -1304,33 +1567,26 @@ class UDMIHandler:
                 payload["logentries"] = flushed_logs
             if metrics_due:
                 payload["metrics"] = _collect_host_metrics()
-                dev["next_metrics_mono"] = now_mono + dev["metrics_rate_sec"]
+                dev["next_metrics_mono"] = now + dev["metrics_rate_sec"]
 
             return json.dumps(payload)
 
-    def get_event_point_payload(self, identifier) -> str:
+    def get_event_point_payload(self, identifier, now_mono: float = None) -> str:
         """
-        Build and serialize a UDMI 1.5 `events/pointset` JSON payload for `identifier`
-        (accepts either `device_id` or `modbus_slave_id`).
-        Only includes configured valid points with numeric values (empty `{}` on gateways
-        with empty `pointset.points`).
+        Build and serialize a UDMI `events/pointset` payload with the configured points that have
+        a fresh, valid reading. `partial_update` is set when configured points are left out.
         """
         with self._lock:
             dev = self._resolve_device_locked(identifier)
             if dev is None:
                 raise KeyError(f"Unknown device '{identifier}'")
-
+            now = time.monotonic() if now_mono is None else now_mono
             points_out = {}
             for pt_name, pt_cfg in dev["configured_points"].items():
-                if pt_name not in dev["known_points"]:
+                value_state, _status = self._evaluate_point_locked(dev, pt_name, pt_cfg, now)
+                if value_state is not None:
                     continue
-                ref_val = (pt_cfg or {}).get("ref")
-                if ref_val is not None and not self._is_valid_point_ref(dev, pt_name, ref_val):
-                    continue
-                pt_slot = dev["points"].get(pt_name) or {}
-                if pt_slot.get("hardware_error"):
-                    continue
-                val = pt_slot.get("present_value")
+                val = dev["points"][pt_name]["present_value"]
                 if isinstance(val, (int, float)) and not isinstance(val, bool):
                     points_out[pt_name] = {"present_value": val}
 
@@ -1339,31 +1595,34 @@ class UDMIHandler:
                 "timestamp": self.get_timestamp(),
                 "points": points_out,
             }
+            if len(points_out) < len(dev["configured_points"]):
+                data["partial_update"] = True
             return json.dumps(data)
 
     def pop_due_pointset_event_payload(self, device_id: str, now_mono: float = None):
         """
-        Return serialized `events/pointset` JSON if `pointset` is active for `device_id`
-        and its per-device `sample_interval_sec` timer has elapsed.
+        Return serialized `events/pointset` JSON when the per-device sample interval elapsed and
+        at least one configured point has a fresh reading.
         """
         with self._lock:
             dev = self._resolve_device_locked(device_id)
-            if dev is None:
+            if dev is None or "pointset" not in dev["active_subblocks"]:
                 return None
-            if "pointset" not in dev["active_subblocks"]:
+            if not dev["configured_points"] or not dev["known_points"]:
                 return None
-            if now_mono is None:
-                now_mono = time.monotonic()
+            now = time.monotonic() if now_mono is None else now_mono
 
             if not dev["has_received_config"]:
-                if (now_mono - dev["created_mono"]) < self.config_wait_timeout_sec:
+                if (now - dev["created_mono"]) < self.config_wait_timeout_sec:
                     return None
-
-            if now_mono < dev["next_pointset_mono"]:
+            if now < dev["next_pointset_mono"]:
                 return None
 
-            dev["next_pointset_mono"] = now_mono + dev["sample_interval_sec"]
-            return self.get_event_point_payload(dev["device_id"])
+            dev["next_pointset_mono"] = now + dev["sample_interval_sec"]
+            payload = self.get_event_point_payload(dev["device_id"], now_mono=now)
+            if not json.loads(payload)["points"]:
+                return None
+            return payload
 
     def get_active_device_ids(self) -> list:
         """Return ordered list of active UDMI device IDs (gateway first, then configured proxies)."""
@@ -1383,3 +1642,10 @@ class UDMIHandler:
                     continue
                 ordered.append(dev_id)
             return ordered
+
+    def get_configured_proxy_ids(self):
+        with self._lock:
+            gw = self.devices_by_id.get(self.gateway_id)
+            if gw is None:
+                return None
+            return list(gw.get("configured_proxy_ids") or [])

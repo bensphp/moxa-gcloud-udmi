@@ -6,69 +6,111 @@
 
 ## Table of Contents
 - [Overview](#overview)
-- [Key Capabilities (UDMI 1.5.2+)](#key-capabilities-udmi-152)
+- [Data Integrity Rules](#data-integrity-rules)
+- [UDMI Capabilities](#udmi-capabilities)
 - [Project Structure](#project-structure)
 - [Installation](#installation)
-- [Configuration & CGW-2 Site Model](#configuration--cgw-2-site-model)
-- [Usage](#usage)
-- [Local Testing & UDMI Sequencer Verification](#local-testing--udmi-sequencer-verification)
+- [Configuration](#configuration)
+- [Site Model Requirements](#site-model-requirements)
+- [Running as a Service](#running-as-a-service)
+- [Testing](#testing)
 - [Contributing](#contributing)
 - [License](#license)
 
 ## Overview
-The **Moxa GCloud UDMI Integration** (`v4.2.0`) bridges Moxa industrial edge gateways (such as the **Moxa UC-8220** running `MXcloudgate`) with **ClearBlade IoT Core**, **Google Cloud IoT Core**, or **local UDMI MQTT reflectors** (`//mqtt/...`) using the **UDMI (Unified Device Management Interface) 1.5.2+** specification.
+The **Moxa GCloud UDMI Integration** (`v4.3.0`) runs on Moxa industrial gateways such as the
+**UC-8220** (Debian 11, Python 3.9). Moxa `MXcloudgate` polls Modbus RTU energy meters (Schneider
+Electric PM5561, PM5111, PM8240) and publishes the raw request/response frames on a local MQTT
+broker. This gateway decodes those frames and acts as a **UDMI 1.5** gateway (e.g. `CGW-2`) for the
+proxied meters (e.g. `EM-11`..`EM-13`), towards **ClearBlade IoT Core** (`/devices/{id}/...` topics,
+JWT authentication) or a **UDMI MQTT broker** (`/r/{registry}/d/{id}/...` topics).
 
 ![image](https://github.com/user-attachments/assets/0a59dbb3-8941-408a-9212-7d70b7078d9e)
 
-## Key Capabilities (UDMI 1.5.2+)
-- **First-Class Gateway & Proxied Device Lifecycle:** Publishes schema-valid UDMI `state`, `events/system`, `events/discovery`, and `events/pointset` for **both** the logical gateway (`CGW-2` / `CGW-1`) and all proxied Schneider Electric Modbus RTU energy meters (`EM-11`..`EM-13`, `PM5561`, `PM5111`, `PM8240`).
-- **System Mode & Self-Enumeration (`system.mode` & `enumeration.*`):**
-  - Supports UDMI `system.operation.mode` transitions (`"restart"` -> `"initial"` -> `"active"`), incrementing `restart_count` and advancing `last_start` (`system_mode_restart`).
-  - Supports UDMI `discovery` self-enumeration (`enumerate_nothing`, `enumerate_pointset`, `enumerate_features`, `enumerate_families`, `enumerate_multi`), synchronizing `state.discovery.generation` and publishing schema-valid `events/discovery` payloads.
-- **Full Downlink `config` Synchronization:** Subscribes to `/devices/{id}/config` (and `/r/{reg}/d/{id}/config` in local `mqtt` reflector mode) for the gateway and every attached proxy device:
-  - Echoes `config.timestamp` to `state.system.last_config` and maintains strict config-to-state **Subblock Parity** (`system`, `gateway`, `pointset`, `localnet`, `discovery`, `blobset`, `alarmset`).
-  - Handles malformed JSON configs (`broken_config`): logs `system.config.receive` (`100`) and `system.config.parse` (`500`), suppresses `system.config.apply`, sets `state.system.status` (`category: "system.config.parse"`, `level: 500`), and preserves the last valid `last_config`.
-  - Honors `system.min_loglevel` across `receive` (`100`), `parse` (`100`/`500`), and `apply` (`300`), and emits periodic `events/system` host `metrics` (`mem_total_mb`, `mem_free_mb`, `store_total_mb`, `store_free_mb`, `load_average`) when `metrics_rate_sec > 0`.
-  - Ignores unknown out-of-schema config fields (`extra_config`) without failing.
-- **Dirty-Only Throttled State Updates:** Publishes `state` only when state content changes (after an initial config holdoff and `>2s` minimum spacing), passing `too_much_state` and strict intermediate state validation.
-- **Dynamic Pointset & Sampling Control:**
-  - Supports per-device `sample_rate_sec` and `sample_limit_sec` (e.g. `pointset_publish_interval` narrow windows), empty gateway pointsets (`points: {}`), dynamic point removal (`pointset_remove_point`), unknown point error reporting (`pointset.point.invalid` at `500`), and invalid `ref` error reporting (`pointset.point.failure` at `500`).
-  - Supports both UDMI 1.5 canonical `ModbusFamilyProvider` point references (`[modbus://<addr>/][<unitid>/]<fc>/<reg>[/<qty>][?type=...]`, e.g. `3/3028/2?type=FLOAT32`) and legacy register addresses (`3028`).
-  - Filters `NaN`/`Inf`/unread Modbus values out of `events/pointset` so numerical points are strictly JSON numbers (`pointset_numeric_values`).
-- **Gateway & Localnet Discovery:**
-  - Discovers real Linux host NIC addresses (`ether`, `ipv4`, `ipv6`) on the gateway (`family_ether_addr`, `family_ipv4_addr`, `family_ipv6_addr`) with multi-NIC (`eth0`/`eth1`) matching, while isolating proxied devices' `state.localnet.families` to their own fieldbus family (`modbus`).
-  - Validates proxied `config.gateway.target` (`bad_target_family`, `bad_target_address` -> `gateway.proxy.target` at `500`) and dynamically syncs `config.gateway.proxy_ids` (`attach`/`detach`).
-- **Hardened Modbus RTU Decoder & MQTT Transport:**
-  - Validates Modbus RTU CRC-16 (`0xA001`), detects Modbus exception responses (`fc | 0x80`), supports odd & multi-register numeric/ASCII formats (`float32`, `float64`, `int64`, `int32u`, `int16u`, `str40`), and supports Python **3.9–3.13+** with both `paho-mqtt` **1.x and 2.x** (`RS256` and `ES256` JWTs).
+## Data Integrity Rules
+The gateway reports what the devices actually say. The UDMI site model is used for configuration
+(which devices and points exist), never as a source of device data:
+
+| Reported value | Source |
+| :--- | :--- |
+| Meter `serial_no`, `software.firmware`, `hardware.make/model` | Meter identity registers (serial 130 or 117, firmware 1637 or 1717, model 50, manufacturer 70). Until the meter has reported them: the configured `serial_no` (or `unknown`), no firmware, `Schneider Electric` / configured meter `type`. |
+| Gateway `serial_no` | Hardware serial (device tree / DMI) if the platform exposes it, otherwise `site_details.serial_no` or `--serial-no`. |
+| Gateway `hardware` / `software` | `site_details.hardware` (default `Moxa` / `UC8220`) / the running gateway version. |
+| Gateway `localnet` (`ether`, `ipv4`, `ipv6`) | Detected on the host. Site model addresses are only used to choose the right NIC on multi-NIC gateways; an address the host does not have is never reported. Re-detected every 60 s. |
+| Meter `localnet.modbus.addr` | The configured serial `port` (e.g. `ttyM0`), if set. |
+| Self-enumeration features / points | The features this code implements and every point in the meter's register map. |
+| Point values | Only **fresh** readings (newer than `modbus.stale_timeout_sec`) are published; see below. |
+
+Telemetry health:
+- A point that has not been read within `modbus.stale_timeout_sec` (default 300 s), that the meter
+  reports as **not available** (FLOAT32 NaN or the Schneider integer sentinels), or whose register
+  block returns a persistent Modbus exception (0x01-0x04) is reported as `value_state: failure` with
+  a `pointset.point.failure` status and is **left out** of `events/pointset`
+  (`partial_update: true`). Before the first reading a point is `initializing`.
+- If a meter sends no valid response for the stale timeout, its `gateway.status` reports
+  `gateway.proxy.connect` and `system.operation.operational` becomes `false`.
+- Transient errors (CRC, framing, busy/timeout exceptions) are logged (rate-limited) and only matter
+  if they persist long enough for the points to go stale, so state does not flap.
+
+## UDMI Capabilities
+- **State and events** for the gateway and every proxied meter: `state`, `events/system` (logs,
+  gateway host `metrics`: `mem_total_mb`, `mem_free_mb`, `store_total_mb`, `store_free_mb`,
+  `system_load`), `events/pointset`, `events/discovery`.
+- **Config handling**: `system.config.receive/parse/apply` logging honouring `min_loglevel`
+  (default 300); broken configs set `system.status` and keep `last_config`; configs are applied
+  atomically (a failing config changes nothing); unknown fields are tolerated; state blocks mirror
+  the config blocks.
+- **State publishing**: only on change, at most every 2.1 s; a state the MQTT client did not accept is
+  re-sent, and state is always re-sent after a (re)connect.
+- **`system.mode` restart** (gateway only): on `restart` the process exits with status **192** and the
+  supervisor starts it again; the new process reports `mode: initial`, a newer `last_start` and a
+  `restart_count` that is persisted in `state_dir` (it counts every process start). It switches to
+  `active` when the config says `active` (or has no mode). `shutdown`/`terminate` are not supported
+  and are reported as warnings.
+- **Gateway proxying**: attaches the configured proxies, follows `gateway.proxy_ids` changes,
+  validates `gateway.target` (family `modbus`, address = configured `port`/unit id, `unitid`) and
+  surfaces cloud `errors` topic messages (e.g. attach failures) as `gateway.setup.attach` status.
+- **Point references** follow the UDMI Modbus grammar:
+  `<function>/<address>[/<quantity>][?type=..&worder=..&border=..]` when the site model's
+  `localnet.families.modbus.unitid` is set (otherwise prefixed with `<unitid>/`), the full form
+  `modbus://<addr>/<unitid>/<function>/<address>[/<quantity>]`, or a bare register number. The
+  address is the meter's register number (e.g. `3028`); FC 3/4 only; the type must match the register
+  map; `worder=LWF`, `border=LSB` and `scale`/`offset` are rejected because they cannot be honoured.
+  `set_value` (writeback) is not supported and reported as `invalid`; blob updates are reported as
+  unsupported.
+- **MQTT**: one paho client (1.x or 2.x) with automatic reconnect (exponential backoff 1-120 s),
+  bounded offline queue, TLS 1.2+ with certificate and hostname verification, RS256/ES256 JWTs
+  refreshed before expiry (`jwt_expires_minutes`, default 60) on the same session.
+- **Modbus RTU decoding**: CRC-16 checked on requests and responses (configurable), exception
+  responses, FLOAT32/64, INT16/32/64 (signed/unsigned) and ASCII registers.
 
 ## Project Structure
 ```plaintext
 moxa-gcloud-udmi/
+├── deploy/moxa-gcloud-udmi.service       # systemd unit (Restart=always, StateDirectory)
 ├── resources/
-│   ├── certs/roots.pem                   # Google / ClearBlade TLS Root CAs
-│   ├── config-google-gateway.json        # Gateway runtime configuration (CGW-2 default)
-│   ├── config-cgw2-example.json          # Annotated CGW-2 + EM-11..13 configuration example
+│   ├── roots.pem                         # Default CA bundle for the cloud MQTT bridge
+│   ├── config-google-gateway.json        # Gateway runtime configuration
+│   ├── config-cgw2-example.json          # CGW-2 + EM-11..13 configuration example
 │   └── modbus_dbo_maps/                  # Schneider Electric register maps (PM5561, PM5111, PM8240)
 ├── src/
-│   ├── main.py                           # Gateway CLI entry point
-│   ├── app_data.py                       # Runtime thread state holder
+│   ├── main.py                           # Entry point (exit codes 0 / 1 / 192)
 │   └── google_iot_core_gateway/
-│       ├── gcp_handler.py                # Main event loop (Modbus queue, downlink configs, UDMI publish)
-│       ├── gcp_publisher.py              # Cloud IoT / ClearBlade (`/devices/...`) & local UDMI (`/r/...`) MQTT client
-│       ├── gcp_manager.py                # Cloud IoT registry/device provisioning helper
-│       ├── internal_broker_subscriber/   # Internal Mosquitto subscriber (`MXcloudgate` RTU frames)
-│       ├── modbus_gw/                    # CRC-16 validated Modbus RTU -> JSON register decoder
-│       ├── udmi_handler/                 # UDMI 1.5.2+ state, config, system event & pointset engine
-│       └── utils/                        # Config, certificate (RSA/EC), JWT & logging utilities
-├── tests/
-│   └── test_udmi_sequencer_compliance.py # Unit & live-Mosquitto end-to-end compliance tests
-├── tools/
-│   └── mxcloudgate_simulator.py          # Synthetic MXcloudgate Modbus RTU publisher (slaves 1, 2, 3)
-└── udmi_site_model/                      # Clean UDMI 1.5.2 site model templates (CGW-2/EM-11..13 & CGW-1/EM-1..3)
+│       ├── gcp_handler.py                # Main loop
+│       ├── gcp_publisher.py              # Cloud / UDMI MQTT client
+│       ├── internal_broker_subscriber/   # Local MXcloudgate broker subscriber
+│       ├── modbus_gw/                    # Modbus RTU frame decoder
+│       ├── udmi_handler/                 # UDMI state, config, events and health engine
+│       ├── utils/                        # Config, certificates, JWT, logging, persistent store
+│       └── gcp_manager.py                # Legacy Cloud IoT Core provisioning helper (not used by
+│                                         # the gateway; needs the retired google-cloud-iot package)
+├── tests/                                # pytest suite (unit + live Mosquitto end-to-end)
+├── tools/mxcloudgate_simulator.py        # MXcloudgate frame simulator with fault injection
+└── udmi_site_model/                      # Site model templates (see Site Model Requirements)
 ```
 
 ## Installation
-Compatible with **Python 3.9–3.13+** (including Debian 11 `python3.9` on Moxa UC-8220).
+Python **3.9+** (including Debian 11 `python3.9` on the UC-8220).
 
 ```bash
 git clone https://github.com/MEUIIOT/moxa-gcloud-udmi.git
@@ -76,58 +118,91 @@ cd moxa-gcloud-udmi
 python3 -m pip install -r requirements.txt
 ```
 
-## Configuration & CGW-2 Site Model
-1. **Gateway Configuration (`resources/config-google-gateway.json`):**
-   Configure `internal_broker` (host/port of the local `MXcloudgate` broker), `google_cloud` (`iot_provider`: `"gbos"` for ClearBlade/GCP IoT Core or `"mqtt"` for a local UDMI reflector broker, `project_id`, `cloud_region`, `mqtt_bridge_hostname`), `site_details` (`gateway_id: "CGW-2"`, `serial_no`, and `proxy_ids` mapping `EM-11` -> slave `1` `PM5561`, `EM-12` -> slave `2` `PM5111`, `EM-13` -> slave `3` `PM8240`), and `environment_setup.udmi_site_model_path`.
-2. **UDMI 1.5.2 Site Model (`udmi_site_model/`):**
-   - Ready-to-use `Registrar`-validated templates are provided under `udmi_site_model/devices/CGW-2` and `udmi_site_model/devices/EM-11..13` (as well as `CGW-1` and `EM-1..3`).
-   - **Important for UDMI Sequencer runs on `CGW-2`:** If your site model previously had `"testing": {"nostate": true}` on `CGW-2` or `EM-11..13` from older v4.1.x deployments, remove `"nostate": true` so the UDMI Sequencer enables all `state`-dependent sequences (`system_last_update`, `broken_config`, `extra_config`, `state_make_model`, `state_software`, `too_much_state`, `family_*_addr`, `gateway_proxy_state`, `pointset_remove_point`, `pointset_request_extraneous`, `bad_target_*`, `bad_point_ref`).
-   - Place the gateway private key (`rsa_private.pem` / `rsa_private.pkcs8` or `ec_private.pem`) in `udmi_site_model/devices/CGW-2/` and register the corresponding public key in ClearBlade / UDMIS.
+## Configuration
+`resources/config-google-gateway.json` (see `resources/config-cgw2-example.json`):
 
-## Usage
-### Running the Gateway
+| Key | Meaning |
+| :--- | :--- |
+| `internal_broker.*` | Local broker where MXcloudgate publishes (`MXcloudgate` topic). |
+| `google_cloud.iot_provider` | `gbos` (ClearBlade / IoT Core topics + JWT) or `mqtt` (UDMI broker). |
+| `google_cloud.project_id`, `mqtt_bridge_hostname`, `mqtt_bridge_port`, `enable_tls`, `ca_cert` | Cloud connection. A configured `ca_cert` must exist; the bundled `resources/roots.pem` falls back to the system trust store if missing. |
+| `google_cloud.sample_rate_set` | Default `events/pointset` interval (s) until the config sets `sample_rate_sec`/`sample_limit_sec`. |
+| `google_cloud.jwt_expires_minutes` | JWT lifetime (1-1440, default 60). |
+| `modbus.stale_timeout_sec` | Freshness limit for readings (default 300). Choose more than 2x the MXcloudgate poll interval. |
+| `modbus.crc_check` | `strict` (default) or `off` if your MXcloudgate version does not forward valid CRCs. |
+| `site_details.gateway_id`, `serial_no`, `hardware`, `localnet.interface` | Gateway identity fallbacks and preferred NIC. |
+| `site_details.proxy_ids.<id>` | `type` (register map), `modbus_slave_id`, optional `port` (e.g. `ttyM0`) and optional fallback `serial_no`. Slave ids must be unique. |
+| `environment_setup.udmi_site_model_path`, `resources_path`, `state_dir` | Paths. `state_dir` defaults to systemd's `StateDirectory`, `/var/lib/moxa-gcloud-udmi` or `~/.local/state/moxa-gcloud-udmi`. |
+
+`cloud_region` and `registry_id` from the site model's `cloud_iot_config.json` override the module
+config; command-line options override both. Secrets (`mqtt_password`) are redacted in debug logs.
+Configuration errors make the process exit with status 1.
+
+Place the gateway private key (`rsa_private.pem` or `ec_private.pem`) in
+`udmi_site_model/devices/<gateway_id>/` and register the matching public key in the cloud registry.
+
+## Site Model Requirements
+The UDMI sequencer compares what the gateway reports with the site model, so the site model must
+describe the real installation:
+- **Meters**: `system.serial_no`, `hardware`, `software.firmware` must match what the meter reports.
+  Configure MXcloudgate to poll the identity registers (30-89, 130 or 117, 1637 or 1717) as well as
+  the measurement registers. `pointset.points` should list every point of the register map (that is
+  what self-enumeration returns); refs use the grammar above, e.g. `3/3028/2?type=FLOAT32` with
+  `localnet.families.modbus` = `{"addr": "<port>", "unitid": "<slave id>"}`.
+- **Gateway**: `localnet.families` must contain only the gateway's real addresses (no `ipv6` unless
+  it has a global IPv6 address); `software` must match the running version (`{"firmware": "4.3.0"}`).
+  The gateway has no points, so it has no `pointset` block.
+- **Features** must equal what the code implements:
+  - gateway: `system` (stable), `gateway`, `system.mode`, `enumeration`, `enumeration.families`,
+    `enumeration.features` (beta);
+  - meters: `system`, `pointset` (stable), `gateway`, `enumeration`, `enumeration.families`,
+    `enumeration.features`, `enumeration.pointset` (beta).
+
+The templates in `udmi_site_model/` follow these rules. Their meter identities match the simulator
+(`tools/mxcloudgate_simulator.py`); gateway serial numbers and addresses are placeholders to replace
+with the real values. No device keys are shipped: generate them per installation (e.g. with the UDMI
+`bin/keygen` tool).
+
+## Running as a Service
 ```bash
 python3 src/main.py -c resources/config-google-gateway.json
 ```
 
-Useful CLI overrides:
+For production use the bundled systemd unit; `Restart=always` is required for UDMI restarts:
 ```bash
-python3 src/main.py \
-  -c resources/config-cgw2-example.json \
-  -iot-provider gbos \
-  -google-cloud-project-id <PROJECT_ID> \
-  -google-cloud-hostname europe-west1-mqtt.clearblade.com \
-  -site-details-registry-id UK-LON-GLAB \
-  -site-details-gateway-id CGW-2 \
-  -serial-no CGW2-UC8220-001 \
-  -v 3
+sudo cp deploy/moxa-gcloud-udmi.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now moxa-gcloud-udmi
+journalctl -u moxa-gcloud-udmi -f
 ```
 
-For local UDMI MQTT reflector testing (`//mqtt/localhost`):
+Exit codes: `0` clean shutdown (SIGTERM/SIGINT), `1` fatal error, `192` UDMI restart request.
+
+For a local UDMI broker:
 ```bash
-python3 src/main.py \
-  -c resources/config-cgw2-example.json \
-  -iot-provider mqtt \
-  -google-cloud-hostname localhost \
-  -google-cloud-port 8883 \
+python3 src/main.py -c resources/config-cgw2-example.json \
+  -iot-provider mqtt -google-cloud-hostname localhost -google-cloud-port 8883 \
   -udmi-site-model-path /path/to/site_model
 ```
 
-## Local Testing & UDMI Sequencer Verification
-Run the automated compliance & end-to-end test suite:
+## Testing
 ```bash
-pytest
+python3 -m pip install -r requirements-dev.txt
+python3 -m pytest
 ```
+The end-to-end tests need the `mosquitto` binary and are skipped without it.
 
-To simulate Moxa `MXcloudgate` Modbus RTU traffic locally against a Mosquitto broker for `EM-11` (slave 1), `EM-12` (slave 2), and `EM-13` (slave 3):
+Simulate MXcloudgate traffic for slaves 1-3 (all register-map points plus identity registers),
+optionally injecting faults:
 ```bash
-python3 tools/mxcloudgate_simulator.py --host 127.0.0.1 --port 1883 --slaves 1,2,3 --interval 2.0
+python3 tools/mxcloudgate_simulator.py --host 127.0.0.1 --port 1883 --slaves 1,2,3 --interval 2.0 \
+  --na 1:3028 --fail-block 2:3000
 ```
 
 ## Contributing
 1. Fork the repository.
 2. Create a feature branch (`git checkout -b feature/my-improvement`).
-3. Ensure `pytest` passes and UDMI `registrar` reports `"CLEAN"` on `udmi_site_model/`.
+3. Ensure `python3 -m pytest` passes and the UDMI registrar validates `udmi_site_model/`.
 4. Submit a pull request.
 
 ## License

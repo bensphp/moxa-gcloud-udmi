@@ -1,0 +1,31 @@
+# systemd unit for moxa-gcloud-udmi on a Moxa UC-8220 (Debian 11).
+#
+# Install:
+#   sudo cp deploy/moxa-gcloud-udmi.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now moxa-gcloud-udmi
+#
+# Restart=always is required: a UDMI `system.operation.mode = restart` request makes the gateway
+# exit with status 192 and systemd starts it again. Fatal configuration errors exit with status 1.
+# StateDirectory= provides /var/lib/moxa-gcloud-udmi, where the restart counter is persisted.
+
+[Unit]
+Description=Moxa MXcloudgate to UDMI gateway (moxa-gcloud-udmi)
+After=network-online.target mosquitto.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=moxa
+WorkingDirectory=/home/moxa/moxa-gcloud-udmi
+ExecStart=/usr/bin/python3 /home/moxa/moxa-gcloud-udmi/src/main.py -c /home/moxa/moxa-gcloud-udmi/resources/config-google-gateway.json
+StateDirectory=moxa-gcloud-udmi
+Restart=always
+RestartSec=5
+# Back off if the configuration is broken (5 failures within 2 minutes).
+StartLimitIntervalSec=120
+StartLimitBurst=5
+TimeoutStopSec=20
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=multi-user.target

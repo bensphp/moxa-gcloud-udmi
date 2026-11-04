@@ -14,30 +14,36 @@
     "sample_rate_set": 10,
     "mqtt_bridge_hostname": "europe-west1-mqtt.clearblade.com",
     "mqtt_bridge_port": 8883,
-    "enable_tls": true
+    "enable_tls": true,
+    "jwt_expires_minutes": 60
+  },
+  "modbus": {
+    "stale_timeout_sec": 300,
+    "crc_check": "strict"
   },
   "site_details": {
     "gateway_id": "CGW-2",
-    "serial_no": "CGW2-UC8220-001",
+    "serial_no": "REPLACE-WITH-UC8220-SERIAL",
     "proxy_ids": {
       "EM-11": {
         "type": "PM5561",
         "modbus_slave_id": 1,
-        "serial_no": "EM-11-SN-001"
+        "port": "ttyM0"
       },
       "EM-12": {
         "type": "PM5111",
         "modbus_slave_id": 2,
-        "serial_no": "EM-12-SN-002"
+        "port": "ttyM0"
       },
       "EM-13": {
         "type": "PM8240",
         "modbus_slave_id": 3,
-        "serial_no": "EM-13-SN-003"
+        "port": "ttyM0"
       }
     }
   },
   "environment_setup": {
-    "udmi_site_model_path": "/home/moxa/moxa-gcloud-udmi/udmi_site_model"
+    "udmi_site_model_path": "/home/moxa/moxa-gcloud-udmi/udmi_site_model",
+    "state_dir": "/var/lib/moxa-gcloud-udmi"
   }
 }

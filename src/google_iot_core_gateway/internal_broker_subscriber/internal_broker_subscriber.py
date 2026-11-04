@@ -1,6 +1,5 @@
 import logging
 import queue
-import ssl
 
 import paho.mqtt.client as mqtt
 
@@ -54,12 +53,11 @@ class MosquittoMQTTSubscriber:
         self.client.on_log = self._on_log
 
         if self._enable_tls:
+            # paho picks PROTOCOL_TLS_CLIENT (TLS 1.2+, certificate verification on).
             self.client.tls_set(
                 ca_certs=self._trusted_root_ca,
                 certfile=self._x509_certificate,
                 keyfile=self._private_key,
-                tls_version=ssl.PROTOCOL_TLSv1_2,
-                ciphers=None,
             )
             self.client.tls_insecure_set(self._tls_insecure_set)
 
