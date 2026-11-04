@@ -46,43 +46,54 @@ Telemetry health:
   reports as **not available** (FLOAT32 NaN or the Schneider integer sentinels), or whose register
   block returns a persistent Modbus exception (0x01-0x04) is reported as `value_state: failure` with
   a `pointset.point.failure` status and is **left out** of `events/pointset`
-  (`partial_update: true`). Before the first reading a point is `initializing`.
-- If a meter sends no valid response for the stale timeout, its `gateway.status` reports
-  `gateway.proxy.connect` and `system.operation.operational` becomes `false`.
+  (`partial_update: true`). Before the first reading a point is `initializing`. A block error is
+  only attributed to points fully inside the failed request that no other request read recently.
+- If a meter sends no response for the stale timeout, its `gateway.status` reports
+  `gateway.proxy.connect` and `system.operation.operational` becomes `false`. Exception replies
+  count as responses (the meter is reachable; only the request is wrong).
 - Transient errors (CRC, framing, busy/timeout exceptions) are logged (rate-limited) and only matter
-  if they persist long enough for the points to go stale, so state does not flap.
+  if they persist long enough for the points to go stale. State changes caused only by telemetry
+  health are published at most every 12 s, so a flapping meter cannot flood the cloud.
 
 ## UDMI Capabilities
 - **State and events** for the gateway and every proxied meter: `state`, `events/system` (logs,
-  gateway host `metrics`: `mem_total_mb`, `mem_free_mb`, `store_total_mb`, `store_free_mb`,
-  `system_load`), `events/pointset`, `events/discovery`.
+  gateway host `metrics` every `metrics_rate_sec` (default 10 s, 0 disables): `mem_total_mb`,
+  `mem_free_mb`, `store_total_mb`, `store_free_mb`, `system_load`), `events/pointset`,
+  `events/discovery`.
 - **Config handling**: `system.config.receive/parse/apply` logging honouring `min_loglevel`
   (default 300); broken configs set `system.status` and keep `last_config`; configs are applied
   atomically (a failing config changes nothing); unknown fields are tolerated; state blocks mirror
-  the config blocks.
-- **State publishing**: only on change, at most every 2.1 s; a state the MQTT client did not accept is
-  re-sent, and state is always re-sent after a (re)connect.
+  the config blocks. A `pointset` block without points means "all readable points".
+- **State publishing**: only on change, at most every 2.1 s (12 s for health-only changes); a state
+  the MQTT client did not accept is re-sent, and state is always re-sent after a (re)connect.
+  Nothing is published while disconnected.
 - **`system.mode` restart** (gateway only): on `restart` the process exits with status **192** and the
   supervisor starts it again; the new process reports `mode: initial`, a newer `last_start` and a
   `restart_count` that is persisted in `state_dir` (it counts every process start). It switches to
   `active` when the config says `active` (or has no mode). `shutdown`/`terminate` are not supported
   and are reported as warnings.
-- **Gateway proxying**: attaches the configured proxies, follows `gateway.proxy_ids` changes,
-  validates `gateway.target` (family `modbus`, address = configured `port`/unit id, `unitid`) and
-  surfaces cloud `errors` topic messages (e.g. attach failures) as `gateway.setup.attach` status.
+- **Gateway proxying**: attaches the configured proxies, follows `gateway.proxy_ids` changes (ids
+  that are not configured locally are reported as `gateway.setup.attach`), validates
+  `gateway.target` (family `modbus`, address = configured `port`/unit id, `unitid`) and surfaces
+  cloud `errors` topic messages (e.g. attach failures) as `gateway.setup.attach` status; these clear
+  on reconnect, when the proxy receives its config, or after 10 minutes without recurrence.
 - **Point references** follow the UDMI Modbus grammar:
-  `<function>/<address>[/<quantity>][?type=..&worder=..&border=..]` when the site model's
-  `localnet.families.modbus.unitid` is set (otherwise prefixed with `<unitid>/`), the full form
-  `modbus://<addr>/<unitid>/<function>/<address>[/<quantity>]`, or a bare register number. The
-  address is the meter's register number (e.g. `3028`); FC 3/4 only; the type must match the register
-  map; `worder=LWF`, `border=LSB` and `scale`/`offset` are rejected because they cannot be honoured.
-  `set_value` (writeback) is not supported and reported as `invalid`; blob updates are reported as
-  unsupported.
-- **MQTT**: one paho client (1.x or 2.x) with automatic reconnect (exponential backoff 1-120 s),
-  bounded offline queue, TLS 1.2+ with certificate and hostname verification, RS256/ES256 JWTs
-  refreshed before expiry (`jwt_expires_minutes`, default 60) on the same session.
-- **Modbus RTU decoding**: CRC-16 checked on requests and responses (configurable), exception
-  responses, FLOAT32/64, INT16/32/64 (signed/unsigned) and ASCII registers.
+  `<function>/<address>[/<quantity>][?type=..&worder=..&border=..]` when the site model gives the unit
+  id (`localnet.families.modbus.unitid`, else `gateway.target.unitid`), otherwise prefixed with
+  `<unitid>/`; the full form `modbus://<addr>/<unitid>/<function>/<address>[/<quantity>]`; or a bare
+  register number. The address is the meter's register number (e.g. `3028`); FC 3/4 only; the type
+  must match the register map; `worder=LWF`, `border=LSB` and `scale`/`offset` are rejected because
+  they cannot be honoured. Unit conversions (`units` different from the register map) are reported
+  as `invalid`. `set_value` (writeback) is not supported and reported as `invalid` (the reading is
+  still published); blob updates and alarms are reported as unsupported.
+- **MQTT**: one paho client (1.x or 2.x) with automatic reconnect (exponential backoff 1-120 s);
+  connection failures are logged with the concrete TCP/TLS reason (rate-limited); TLS 1.2+ with
+  certificate and hostname verification on every Python version; RS256/ES256 JWTs
+  (`jwt_expires_minutes`, 10-1440, default 60) are refreshed before expiry by reconnecting the same
+  client, so unacknowledged QoS 1 messages are re-sent.
+- **Modbus RTU decoding**: CRC-16 checked on responses and on 8-byte requests (configurable),
+  exception responses, FLOAT32 (7 significant digits)/FLOAT64, INT16/32/64 (signed/unsigned) and
+  ASCII registers.
 
 ## Project Structure
 ```plaintext
@@ -126,8 +137,8 @@ python3 -m pip install -r requirements.txt
 | `internal_broker.*` | Local broker where MXcloudgate publishes (`MXcloudgate` topic). |
 | `google_cloud.iot_provider` | `gbos` (ClearBlade / IoT Core topics + JWT) or `mqtt` (UDMI broker). |
 | `google_cloud.project_id`, `mqtt_bridge_hostname`, `mqtt_bridge_port`, `enable_tls`, `ca_cert` | Cloud connection. A configured `ca_cert` must exist; the bundled `resources/roots.pem` falls back to the system trust store if missing. |
-| `google_cloud.sample_rate_set` | Default `events/pointset` interval (s) until the config sets `sample_rate_sec`/`sample_limit_sec`. |
-| `google_cloud.jwt_expires_minutes` | JWT lifetime (1-1440, default 60). |
+| `google_cloud.sample_rate_set` | Default `events/pointset` interval (s, default 300) until the config sets `sample_rate_sec`/`sample_limit_sec`. |
+| `google_cloud.jwt_expires_minutes` | JWT lifetime (10-1440, default 60). |
 | `modbus.stale_timeout_sec` | Freshness limit for readings (default 300). Choose more than 2x the MXcloudgate poll interval. |
 | `modbus.crc_check` | `strict` (default) or `off` if your MXcloudgate version does not forward valid CRCs. |
 | `site_details.gateway_id`, `serial_no`, `hardware`, `localnet.interface` | Gateway identity fallbacks and preferred NIC. |
@@ -158,17 +169,20 @@ describe the real installation:
   - meters: `system`, `pointset` (stable), `gateway`, `enumeration`, `enumeration.families`,
     `enumeration.features`, `enumeration.pointset` (beta).
 
-The templates in `udmi_site_model/` follow these rules. Their meter identities match the simulator
-(`tools/mxcloudgate_simulator.py`); gateway serial numbers and addresses are placeholders to replace
-with the real values. No device keys are shipped: generate them per installation (e.g. with the UDMI
-`bin/keygen` tool).
+The templates in `udmi_site_model/` follow these rules. Their meter identities (serial numbers,
+firmware) are the simulator's (`tools/mxcloudgate_simulator.py`) and, like the gateway serial
+numbers and addresses, are placeholders to replace with the real values. No device keys are
+shipped: generate them per installation (e.g. with the UDMI `bin/keygen` tool); the UDMI registrar
+reports the gateways as incomplete until their keys exist.
 
 ## Running as a Service
 ```bash
 python3 src/main.py -c resources/config-google-gateway.json
 ```
 
-For production use the bundled systemd unit; `Restart=always` is required for UDMI restarts:
+For production use the bundled systemd unit; `Restart=always` is required for UDMI restarts, and
+the unit keeps retrying every 10 s (also after configuration errors, so the gateway recovers on its
+own once the configuration is fixed):
 ```bash
 sudo cp deploy/moxa-gcloud-udmi.service /etc/systemd/system/
 sudo systemctl daemon-reload
@@ -176,7 +190,8 @@ sudo systemctl enable --now moxa-gcloud-udmi
 journalctl -u moxa-gcloud-udmi -f
 ```
 
-Exit codes: `0` clean shutdown (SIGTERM/SIGINT), `1` fatal error, `192` UDMI restart request.
+Exit codes (also for `python3 -m google_iot_core_gateway`): `0` clean shutdown (SIGTERM/SIGINT),
+`1` fatal error, `192` UDMI restart request.
 
 For a local UDMI broker:
 ```bash

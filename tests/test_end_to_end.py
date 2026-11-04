@@ -15,7 +15,7 @@ import types
 import paho.mqtt.client as mqtt
 import pytest
 
-from conftest import REPO_ROOT, RESOURCES_DIR, find_free_port, write_site_model
+from conftest import MOSQUITTO, REPO_ROOT, RESOURCES_DIR, find_free_port, write_site_model
 from google_iot_core_gateway.errors import EXIT_FATAL, EXIT_OK, EXIT_RESTART
 from google_iot_core_gateway.gcp_handler import run_gateway_loop
 from google_iot_core_gateway.gcp_publisher import GoogleIoTCoreMQTTPublisher
@@ -25,7 +25,6 @@ from google_iot_core_gateway.internal_broker_subscriber.internal_broker_subscrib
 from google_iot_core_gateway.udmi_handler.udmi_handler import UDMIHandler
 import mxcloudgate_simulator as sim
 
-MOSQUITTO = "/usr/sbin/mosquitto"
 pytestmark = pytest.mark.skipif(not os.path.exists(MOSQUITTO), reason="mosquitto not installed")
 PREFIX = "/r/UK-LON-GLAB/d"
 
@@ -247,11 +246,15 @@ def test_system_mode_restart_really_restarts(tmp_path, broker):
         assert json.loads((state_dir / "persistent_data.json").read_text())["restart_count"] == 1
 
         # The supervisor (systemd Restart=always) starts the gateway again.
+        mark = observer.mark()
         proc = _start_main(config_path)
-        restarted = observer.wait_for(_state_of("CGW-2", lambda s: s["system"]["operation"]["restart_count"] == 2), timeout=20)
+        restarted = observer.wait_for(
+            _state_of("CGW-2", lambda s: s["system"]["operation"]["restart_count"] == 2), timeout=20, since=mark)
         assert json.loads(restarted[1])["system"]["operation"]["mode"] == "initial"
+        mark = observer.mark()
         observer.send_config("CGW-2", _base_config("2026-11-04T12:00:10Z", system={"operation": {"mode": "active"}}))
-        observer.wait_for(_state_of("CGW-2", lambda s: s["system"]["operation"]["mode"] == "active"), timeout=20)
+        observer.wait_for(_state_of("CGW-2", lambda s: s["system"]["operation"]["mode"] == "active"
+                                    and s["system"]["operation"]["restart_count"] == 2), timeout=20, since=mark)
         proc.terminate()
         assert proc.wait(timeout=20) == EXIT_OK
     finally:

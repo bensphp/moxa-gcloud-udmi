@@ -83,10 +83,6 @@ DECODE_NOT_AVAILABLE = "not_available"
 DECODE_INVALID = "invalid"
 
 
-def is_even(number):
-    return number % 2 == 0
-
-
 def compute_modbus_crc16(data: bytes) -> int:
     """Compute standard Modbus RTU CRC-16 (polynomial 0xA001, little-endian on wire)."""
     crc = 0xFFFF
@@ -141,10 +137,6 @@ def flatten_meter_registers(data):
         elif isinstance(value, dict) and "number_of_registers" in value:
             flat[str(key)] = value
     return flat
-
-
-# Backward-compatible private alias.
-_flatten_meter_registers = flatten_meter_registers
 
 
 def get_register_offset(register_address, starting_address, total_bytes):
@@ -229,16 +221,14 @@ def decode_register_bytes(byte_value: bytes, data_format: str):
     if fmt.startswith("float"):
         if math.isnan(value) or math.isinf(value):
             return DECODE_NOT_AVAILABLE, None
-        return DECODE_OK, round(float(value), 6)
+        if fmt == "float32":
+            # FLOAT32 carries ~7 significant digits: 230.1 instead of 230.10000610351562, without
+            # losing small values (fixed decimal rounding would turn 4e-07 into 0.0).
+            return DECODE_OK, float(format(value, ".7g"))
+        return DECODE_OK, float(value)
     if _INT_NOT_AVAILABLE.get(fmt) == value:
         return DECODE_NOT_AVAILABLE, None
     return DECODE_OK, value
-
-
-def _decode_register_bytes(byte_value: bytes, data_format: str):
-    """Backward-compatible helper returning only the decoded value (None if unusable)."""
-    status, value = decode_register_bytes(byte_value, data_format)
-    return value if status == DECODE_OK else None
 
 
 def modbus_to_json(rtu_request, rtu_response, slave_to_type=None, dbo_maps=None, strict_crc=True):
@@ -292,8 +282,12 @@ def build_fc3_fc4_payload(
         "exception_code": None,
     }
 
-    if strict_crc and len(rtu_request) >= 8 and not verify_modbus_crc16(rtu_request[:8]):
-        return _error_payload(payload, ERROR_CRC, "Modbus RTU request CRC-16 mismatch")
+    if strict_crc:
+        # An FC03/FC04 RTU request is 6 bytes plus a 2-byte CRC; accept CRC-less 6-byte requests.
+        if len(rtu_request) not in (6, 8):
+            return _error_payload(payload, ERROR_FRAMING, "Invalid Modbus RTU request length")
+        if len(rtu_request) == 8 and not verify_modbus_crc16(rtu_request):
+            return _error_payload(payload, ERROR_CRC, "Modbus RTU request CRC-16 mismatch")
 
     if isinstance(rtu_response, Exception):
         return _error_payload(payload, ERROR_TRANSPORT, str(rtu_response))

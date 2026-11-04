@@ -43,7 +43,6 @@
     }
   },
   "environment_setup": {
-    "udmi_site_model_path": "/home/moxa/moxa-gcloud-udmi/udmi_site_model",
-    "state_dir": "/var/lib/moxa-gcloud-udmi"
+    "udmi_site_model_path": "/home/moxa/moxa-gcloud-udmi/udmi_site_model"
   }
 }

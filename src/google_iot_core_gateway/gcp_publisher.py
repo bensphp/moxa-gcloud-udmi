@@ -196,6 +196,10 @@ class GoogleIoTCoreMQTTPublisher:
             return None
         return (self._jwt_exp - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
 
+    def _jwt_refresh_margin(self) -> float:
+        """Refresh 5 minutes before expiry, or after 80% of the lifetime for short-lived tokens."""
+        return min(JWT_REFRESH_MARGIN_SEC, self._jwt_expires_minutes * 60 * 0.2)
+
     def _build_tls_context(self) -> ssl.SSLContext:
         ca_certs = None
         if self._ca_cert:
@@ -274,7 +278,7 @@ class GoogleIoTCoreMQTTPublisher:
     def maintain(self):
         """Called periodically from the main loop: refresh the JWT before it expires."""
         seconds_left = self._jwt_seconds_left()
-        if seconds_left is None or seconds_left > JWT_REFRESH_MARGIN_SEC:
+        if seconds_left is None or seconds_left > self._jwt_refresh_margin():
             return
         try:
             self._refresh_jwt_credentials()
@@ -391,7 +395,7 @@ class GoogleIoTCoreMQTTPublisher:
                 f"MQTT connection lost ({self.error_str(rc)}); reconnecting with backoff",
             )
         seconds_left = self._jwt_seconds_left()
-        if seconds_left is not None and seconds_left <= JWT_REFRESH_MARGIN_SEC:
+        if seconds_left is not None and seconds_left <= self._jwt_refresh_margin():
             try:
                 self._refresh_jwt_credentials()
             except Exception as exc:  # noqa: BLE001 - keep the network thread alive

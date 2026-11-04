@@ -64,7 +64,7 @@ class ConfigHandler:
         self.google_cloud__iot_provider = "gbos"
         self.google_cloud__cloud_region = "europe-west1"
         self.google_cloud__project_id = "moxa01-iot-core"
-        self.google_cloud__sample_rate_set = 1800
+        self.google_cloud__sample_rate_set = 300  # UDMI config_pointset.json default
         self.google_cloud__mqtt_bridge_hostname = "mqtt.googleapis.com"
         self.google_cloud__mqtt_bridge_port = 8883
         self.google_cloud__enable_tls = True
@@ -275,6 +275,8 @@ class ConfigHandler:
             self.site_details__serial_no = str(args.site_details__serial_no)
 
     def _validate(self):
+        if not 10 <= self.google_cloud__jwt_expires_minutes <= 1440:
+            raise GatewayConfigError("google_cloud.jwt_expires_minutes must be between 10 and 1440")
         if self.modbus__crc_check not in CRC_CHECK_MODES:
             raise GatewayConfigError(
                 f"modbus.crc_check must be one of {CRC_CHECK_MODES}, got '{self.modbus__crc_check}'"

@@ -1,5 +1,7 @@
 import logging
 import queue
+import threading
+import time
 
 import paho.mqtt.client as mqtt
 
@@ -41,6 +43,8 @@ class MosquittoMQTTSubscriber:
         self._tls_insecure_set = disable_tls_cert_verification
         self._enable_tls = enable_tls
         self._topic = topic
+        self._dropped = 0
+        self._last_drop_log = 0.0
 
         self.client = _create_paho_client()
         self.client.reconnect_delay_set(min_delay=1, max_delay=60)
@@ -102,24 +106,30 @@ class MosquittoMQTTSubscriber:
             self.logger.warning("Ignoring non-UTF8 payload on internal broker")
             return
 
-        self.logger.debug(
-            "Received message on internal topic '{}' with QoS {}".format(
-                message.topic, message.qos
-            )
-        )
+        self.logger.debug("Received message on internal topic '%s' with QoS %s", message.topic, message.qos)
 
-        # Non-blocking enqueue: drop oldest frame if queue is full so MQTT loop never deadlocks
+        # Non-blocking enqueue: drop the oldest frame if the queue is full so the MQTT loop never
+        # blocks; report drops (rate-limited) because they mean the main loop is falling behind.
+        try:
+            self.google_iot_core_queue.put_nowait(payload)
+            return
+        except queue.Full:
+            pass
+        try:
+            self.google_iot_core_queue.get_nowait()
+        except queue.Empty:
+            pass
         try:
             self.google_iot_core_queue.put_nowait(payload)
         except queue.Full:
-            try:
-                self.google_iot_core_queue.get_nowait()
-            except queue.Empty:
-                pass
-            try:
-                self.google_iot_core_queue.put_nowait(payload)
-            except queue.Full:
-                pass
+            pass
+        self._dropped += 1
+        now = time.monotonic()
+        if now - self._last_drop_log >= 300.0:
+            self.logger.warning(
+                f"Internal Modbus frame queue full: dropped {self._dropped} oldest frame(s) so far"
+            )
+            self._last_drop_log = now
 
     def _on_log(self, client, user_data, level, buf):
         self.logger.debug("on_log: (%s) - %s ", level, buf)
@@ -127,12 +137,21 @@ class MosquittoMQTTSubscriber:
     def run(self):
         self.client.loop_start()
 
-    def stop(self):
+    def stop(self, timeout: float = 5.0):
+        """Disconnect, then stop the network thread without blocking shutdown for long."""
+        try:
+            self.client.disconnect()
+        except Exception as e:  # noqa: BLE001 - best effort during shutdown
+            self.logger.debug(f"Error disconnecting internal broker subscriber: {e}")
+        stopper = threading.Thread(target=self._safe_loop_stop, daemon=True)
+        stopper.start()
+        stopper.join(timeout)
+
+    def _safe_loop_stop(self):
         try:
             self.client.loop_stop()
-            self.client.disconnect()
-        except Exception as e:
-            self.logger.debug(f"Error stopping internal broker subscriber: {e}")
+        except Exception:  # noqa: BLE001 - best effort during shutdown
+            pass
 
 
 def main():

@@ -5,13 +5,16 @@
 #   sudo systemctl daemon-reload && sudo systemctl enable --now moxa-gcloud-udmi
 #
 # Restart=always is required: a UDMI `system.operation.mode = restart` request makes the gateway
-# exit with status 192 and systemd starts it again. Fatal configuration errors exit with status 1.
-# StateDirectory= provides /var/lib/moxa-gcloud-udmi, where the restart counter is persisted.
+# exit with status 192 and systemd starts it again. Fatal configuration errors exit with status 1
+# and are retried every RestartSec forever (an unattended gateway recovers once the configuration
+# is fixed). StateDirectory= provides /var/lib/moxa-gcloud-udmi for the persisted restart counter.
 
 [Unit]
 Description=Moxa MXcloudgate to UDMI gateway (moxa-gcloud-udmi)
 After=network-online.target mosquitto.service
 Wants=network-online.target
+# Never stop retrying (the default start limit would give up after a few quick failures).
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -20,10 +23,7 @@ WorkingDirectory=/home/moxa/moxa-gcloud-udmi
 ExecStart=/usr/bin/python3 /home/moxa/moxa-gcloud-udmi/src/main.py -c /home/moxa/moxa-gcloud-udmi/resources/config-google-gateway.json
 StateDirectory=moxa-gcloud-udmi
 Restart=always
-RestartSec=5
-# Back off if the configuration is broken (5 failures within 2 minutes).
-StartLimitIntervalSec=120
-StartLimitBurst=5
+RestartSec=10
 TimeoutStopSec=20
 KillSignal=SIGTERM
 

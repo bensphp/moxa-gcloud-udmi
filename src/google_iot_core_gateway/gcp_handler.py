@@ -333,11 +333,11 @@ def process_payloads(logger, google_iot_core_queue, udmi_handler, max_batch=64, 
             if payload.get("fc") not in (3, 4):
                 continue
             udmi_handler.record_modbus_payload(payload)
-        except (ValueError, KeyError, TypeError, AttributeError) as ex:
+        except Exception as ex:  # noqa: BLE001 - one bad message must never stop the gateway
             _log_throttled(
                 ("bad_frame", type(ex).__name__),
                 logger.warning,
-                f"Ignoring malformed MXcloudgate message ({type(ex).__name__}: {ex})",
+                f"Ignoring malformed MXcloudgate message ({type(ex).__name__}: {str(ex)[:200]})",
             )
 
     return processed
@@ -466,8 +466,10 @@ def run_gateway_loop(logger, config, google_iot_core_publisher, udmi_handler, go
 
         generation = google_iot_core_publisher.connection_generation
         if generation != last_generation:
-            # New MQTT session: anything sent on the old one may be lost, so send state again.
+            # New MQTT session: anything sent on the old one may be lost, so send state again;
+            # proxies are re-attached, so earlier cloud attach errors no longer apply.
             last_generation = generation
+            udmi_handler.clear_attach_errors()
             udmi_handler.force_republish_all()
 
         if google_iot_core_publisher.is_connected():

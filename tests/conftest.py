@@ -4,6 +4,7 @@
 
 import json
 import logging
+import shutil
 import socket
 import sys
 from pathlib import Path
@@ -19,6 +20,19 @@ for _path in (SRC_DIR, TOOLS_DIR):
 
 RESOURCES_DIR = str(REPO_ROOT / "resources")
 UDMI_VERSION_FOR_TESTS = "1.5.2"
+MOSQUITTO = shutil.which("mosquitto") or "/usr/sbin/mosquitto"
+
+# Identity values that only exist in the fixture site model: the gateway must never report them.
+META_GATEWAY_IDENTITY = {
+    "hardware": {"make": "MetaMake", "model": "MetaModel"},
+    "software": {"firmware": "0.0.1-meta"},
+    "serial_no": "META-GW-SERIAL",
+}
+META_METER_IDENTITY = {
+    "hardware": {"make": "MetaMeterMake", "model": "PM9999"},
+    "software": {"firmware": "9.9-meta"},
+    "serial_no": "META-EM-SERIAL",
+}
 
 
 def find_free_port() -> int:
@@ -27,11 +41,23 @@ def find_free_port() -> int:
         return sock.getsockname()[1]
 
 
-def write_site_model(base_dir: Path, em11_points=None, em11_localnet=None, cgw2_localnet=None) -> Path:
-    """Create a minimal CGW-2 + EM-11 (PM5561, unit 1 on ttyM0) site model."""
+def _meter_metadata(gateway_id, unit, points):
+    return {
+        "version": UDMI_VERSION_FOR_TESTS,
+        "timestamp": "2024-09-23T10:46:31Z",
+        "system": json.loads(json.dumps(META_METER_IDENTITY)),
+        "gateway": {"gateway_id": gateway_id, "target": {"family": "modbus"}},
+        "localnet": {"families": {"modbus": {"addr": "ttyM0", "unitid": str(unit)}}},
+        "pointset": {"points": points},
+    }
+
+
+def write_site_model(base_dir: Path, em11_points=None, em11_localnet=None, cgw2_localnet=None, with_em12=False) -> Path:
+    """Create a minimal CGW-2 + EM-11 (PM5561, unit 1 on ttyM0) [+ EM-12 (PM5111, unit 2)] site model."""
     site_dir = base_dir / "site_model"
-    (site_dir / "devices" / "CGW-2").mkdir(parents=True)
-    (site_dir / "devices" / "EM-11").mkdir(parents=True)
+    devices = ["CGW-2", "EM-11"] + (["EM-12"] if with_em12 else [])
+    for device in devices:
+        (site_dir / "devices" / device).mkdir(parents=True)
     (site_dir / "cloud_iot_config.json").write_text(
         json.dumps({"cloud_region": "europe-west1", "site_name": "UK-LON-GLAB", "registry_id": "UK-LON-GLAB"}),
         encoding="utf-8",
@@ -39,26 +65,23 @@ def write_site_model(base_dir: Path, em11_points=None, em11_localnet=None, cgw2_
     cgw2_meta = {
         "version": UDMI_VERSION_FOR_TESTS,
         "timestamp": "2024-09-23T10:46:31Z",
-        "system": {"hardware": {"make": "Moxa", "model": "UC8220"}},
-        "gateway": {"proxy_ids": ["EM-11"]},
+        "system": json.loads(json.dumps(META_GATEWAY_IDENTITY)),
+        "gateway": {"proxy_ids": [d for d in devices if d != "CGW-2"]},
         "localnet": cgw2_localnet or {"families": {"ether": {"addr": "00:90:e8:11:22:33"}}},
     }
     (site_dir / "devices" / "CGW-2" / "metadata.json").write_text(json.dumps(cgw2_meta), encoding="utf-8")
-    em11_meta = {
-        "version": UDMI_VERSION_FOR_TESTS,
-        "timestamp": "2024-09-23T10:46:31Z",
-        "system": {"hardware": {"make": "Schneider Electric", "model": "PM5561"}},
-        "gateway": {"gateway_id": "CGW-2", "target": {"family": "modbus"}},
-        "localnet": em11_localnet or {"families": {"modbus": {"addr": "ttyM0", "unitid": "1"}}},
-        "pointset": {
-            "points": em11_points
-            or {
-                "line1_neutral_voltage_sensor": {"units": "Volts", "ref": "3/3028/2?type=FLOAT32"},
-                "frequency_sensor": {"units": "Hertz", "ref": "3/3110/2?type=FLOAT32"},
-            }
-        },
+    default_points = {
+        "line1_neutral_voltage_sensor": {"units": "Volts", "ref": "3/3028/2?type=FLOAT32"},
+        "frequency_sensor": {"units": "Hertz", "ref": "3/3110/2?type=FLOAT32"},
     }
+    em11_meta = _meter_metadata("CGW-2", 1, em11_points or default_points)
+    if em11_localnet:
+        em11_meta["localnet"] = em11_localnet
     (site_dir / "devices" / "EM-11" / "metadata.json").write_text(json.dumps(em11_meta), encoding="utf-8")
+    if with_em12:
+        (site_dir / "devices" / "EM-12" / "metadata.json").write_text(
+            json.dumps(_meter_metadata("CGW-2", 2, default_points)), encoding="utf-8"
+        )
     return site_dir
 
 

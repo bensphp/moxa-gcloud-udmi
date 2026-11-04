@@ -25,7 +25,7 @@ from google_iot_core_gateway.udmi_handler.udmi_handler import (
     PROXY_FEATURES,
     parse_modbus_ref,
 )
-from conftest import RESOURCES_DIR, write_site_model
+from conftest import META_METER_IDENTITY, RESOURCES_DIR, write_site_model
 
 V = "1.5.2"
 
@@ -119,12 +119,23 @@ class TestConfigHandling:
         h = handler_factory()
         assert h.handle_config("EM-11", _em11_config())
         before = _state(h)
+        dev = h.devices_by_id["EM-11"]
+        before_loglevel = dev["min_loglevel"]
+        # Fails in the gateway step, after system settings and subblocks were already processed.
         monkeypatch.setattr(h, "_validate_target", lambda dev, target: 1 / 0)
-        assert not h.handle_config("EM-11", _em11_config("2026-11-04T11:00:00Z", points={}))
+        failing = _config(
+            "2026-11-04T11:00:00Z",
+            system={"min_loglevel": LEVEL_DEBUG, "operation": {"mode": "active"}},
+            gateway={"target": {"family": "modbus"}},
+            pointset={"points": {"frequency_sensor": {}}},
+        )
+        assert not h.handle_config("EM-11", failing)
         after = _state(h)
         assert after["system"]["status"]["category"] == CATEGORY_SYSTEM_CONFIG_APPLY
         assert after["system"]["last_config"] == before["system"]["last_config"]
         assert after["pointset"] == before["pointset"]
+        assert set(after) == set(before)  # localnet block (absent from the failing config) kept
+        assert dev["min_loglevel"] == before_loglevel
 
     def test_unsupported_modes_are_reported_not_applied(self, handler_factory):
         h = handler_factory()
@@ -168,8 +179,11 @@ class TestIdentity:
     def test_proxy_identity_comes_from_meter_registers(self, handler_factory):
         h = handler_factory()
         state = _state(h)
+        # The fixture site model has META_METER_IDENTITY; none of it may be echoed back.
         assert state["system"]["serial_no"] == "unknown"
         assert state["system"]["software"] == {}
+        assert state["system"]["hardware"] == {"make": "Schneider Electric", "model": "PM5561"}
+        assert META_METER_IDENTITY["serial_no"] not in json.dumps(state)
         h.record_modbus_payload(_frame({130: 987654321, 1637: 1103, 50: "PM5560", 70: "Schneider Electric"}, start=1, qty=2000))
         state = _state(h)
         assert state["system"]["serial_no"] == "987654321"
@@ -190,6 +204,8 @@ class TestIdentity:
         assert system["serial_no"] == "CGW2-CONFIGURED"
         assert system["software"] == {"firmware": module.GATEWAY_SOFTWARE_VERSION}
         assert system["hardware"] == {"make": "Moxa", "model": "UC8220"}
+        for value in ("META-GW-SERIAL", "MetaMake", "0.0.1-meta"):
+            assert value not in json.dumps(system)
 
 
 class TestLocalnet:

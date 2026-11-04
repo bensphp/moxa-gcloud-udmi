@@ -31,8 +31,10 @@ class PersistentStore:
             return {}
 
     def save(self, data: dict) -> bool:
+        """Atomically replace the data file (write temp file, fsync, rename, fsync directory)."""
         if not self.path:
             return False
+        tmp_path = None
         try:
             os.makedirs(self.state_dir, exist_ok=True)
             fd, tmp_path = tempfile.mkstemp(prefix=".persistent_", dir=self.state_dir)
@@ -41,10 +43,25 @@ class PersistentStore:
                 fh.flush()
                 os.fsync(fh.fileno())
             os.replace(tmp_path, self.path)
+            tmp_path = None
+            try:
+                dir_fd = os.open(self.state_dir, os.O_RDONLY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            except OSError:
+                pass  # directory fsync is best effort (not supported everywhere)
             return True
         except OSError as exc:
             self.logger.error(f"Could not write persistent data '{self.path}': {exc}")
             return False
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
 
     def increment_restart_count(self) -> int:
         """Increment and persist the process start counter; returns the new value (>= 1)."""

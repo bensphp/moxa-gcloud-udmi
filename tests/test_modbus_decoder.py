@@ -49,12 +49,24 @@ class TestCrc:
 
 class TestDecoder:
     def test_float32_decoding_and_request_metadata(self):
-        req, resp = _frames(3028, 2, struct.pack(">f", 230.5))
+        req, resp = _frames(3028, 2, struct.pack(">f", 230.1))
         decoded = _decode(req, resp)
         assert decoded["error"] is None
-        assert decoded["data"]["3028"] == pytest.approx(230.5)
+        assert decoded["data"]["3028"] == 230.1  # 7 significant digits, no float32 noise
         assert decoded["start_register"] == 3028
         assert decoded["quantity"] == 2
+
+    def test_small_float32_values_keep_their_precision(self):
+        for value in (4e-07, 0.00098765):
+            req, resp = _frames(3028, 2, struct.pack(">f", value))
+            assert _decode(req, resp)["data"]["3028"] == pytest.approx(value, rel=1e-6)
+
+    def test_request_length_is_checked(self):
+        _, resp = _frames(3028, 2, struct.pack(">f", 230.5))
+        seven_byte_request = struct.pack(">BBHH", 1, 3, 3027, 2) + b"\x00"
+        assert _decode(seven_byte_request, resp)["error_kind"] == "framing"
+        six_byte_request = struct.pack(">BBHH", 1, 3, 3027, 2)  # no CRC forwarded
+        assert _decode(six_byte_request, resp)["data"]["3028"] == 230.5
 
     def test_nan_is_reported_as_unavailable_not_dropped(self):
         req, resp = _frames(3028, 2, struct.pack(">f", float("nan")))
