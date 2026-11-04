@@ -594,6 +594,13 @@ class UDMIHandler:
                 "make": str(hw_cfg.get("make") or "Moxa"),
                 "model": str(hw_cfg.get("model") or "UC8220"),
             }
+            if not (hw_cfg.get("make") and hw_cfg.get("model")):
+                # The platform model is not detectable reliably (the device tree may only name the
+                # series), so the installer must declare it; say so instead of failing silently.
+                self.logger.warning(
+                    f"site_details.hardware does not set both make and model; reporting the default "
+                    f"{record['hardware']} for gateway '{gateway_id}'. Set it to the real gateway model."
+                )
             record["software"] = {"firmware": GATEWAY_SOFTWARE_VERSION}
 
             detected_serial = detect_hardware_serial()
@@ -1414,12 +1421,23 @@ class UDMIHandler:
                     blob_state["generation"] = str(blob_spec["generation"])
                 dev["blob_states"][str(blob_id)] = blob_state
 
-        # 8. Alarmset subblock: alarms are not implemented; configured alarms are marked invalid.
+        # 8. Alarmset subblock: alarms are not implemented; each configured alarm is marked invalid
+        # with a status saying why (writeback.md: error value states carry a status).
         dev["alarm_states"] = {}
         alarm_cfg = config.get("alarmset")
         alarms = alarm_cfg.get("alarms") if isinstance(alarm_cfg, dict) else None
         if isinstance(alarms, dict) and alarms:
-            dev["alarm_states"] = {str(alarm_id): {"value_state": "invalid"} for alarm_id in alarms}
+            dev["alarm_states"] = {
+                str(alarm_id): {
+                    "value_state": "invalid",
+                    "status": self.make_entry(
+                        CATEGORY_SYSTEM_CONFIG_APPLY,
+                        LEVEL_ERROR,
+                        f"Alarm '{alarm_id}' is not supported by this device",
+                    ),
+                }
+                for alarm_id in alarms
+            }
             warnings.append("alarmset alarms are not supported by this device; ignored")
 
         # 9. last_config and system status

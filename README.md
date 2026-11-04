@@ -35,7 +35,7 @@ The gateway reports what the devices actually say. The UDMI site model is used f
 | :--- | :--- |
 | Meter `serial_no`, `software.firmware`, `hardware.make/model` | Meter identity registers (serial 130 or 117, firmware 1637 or 1717, model 50, manufacturer 70). Until the meter has reported them: the configured `serial_no` (or `unknown`), no firmware, `Schneider Electric` / configured meter `type`. |
 | Gateway `serial_no` | Hardware serial (device tree / DMI) if the platform exposes it, otherwise `site_details.serial_no` or `--serial-no`. |
-| Gateway `hardware` / `software` | `site_details.hardware` (default `Moxa` / `UC8220`) / the running gateway version. |
+| Gateway `hardware` / `software` | `site_details.hardware` / the running gateway version. The platform model is not detected (the device tree may only name the series): without `site_details.hardware` the gateway reports `Moxa` / `UC8220` and logs a warning. |
 | Gateway `localnet` (`ether`, `ipv4`, `ipv6`) | Detected on the host. Site model addresses are only used to choose the right NIC on multi-NIC gateways; an address the host does not have is never reported. Re-detected every 60 s. |
 | Meter `localnet.modbus.addr` | The configured serial `port` (e.g. `ttyM0`), if set. |
 | Self-enumeration features / points | The features this code implements and every point in the meter's register map. |
@@ -86,7 +86,7 @@ Telemetry health:
   must match the register map; `worder=LWF`, `border=LSB` and `scale`/`offset` are rejected because
   they cannot be honoured. Unit conversions (`units` different from the register map) are reported
   as `invalid`. `set_value` (writeback) is not supported and reported as `invalid` (the reading is
-  still published); blob updates and alarms are reported as unsupported.
+  still published); blob updates and alarms are reported as unsupported (each with a status).
 - **MQTT**: one paho client (1.x or 2.x) with automatic reconnect (exponential backoff 1-120 s);
   connection failures are logged with the concrete TCP/TLS reason (rate-limited); TLS 1.2+ with
   certificate and hostname verification on every Python version; RS256/ES256 JWTs

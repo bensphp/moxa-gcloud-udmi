@@ -3,6 +3,7 @@
 """UDMIHandler behaviour tests: config handling, data integrity, identity, restart, refs."""
 
 import json
+import logging
 import time
 
 import pytest
@@ -154,6 +155,20 @@ class TestIdentity:
         assert system["hardware"] == {"make": "Moxa", "model": "UC8220"}
         for value in ("META-GW-SERIAL", "MetaMake", "0.0.1-meta"):
             assert value not in json.dumps(system)
+
+    def test_gateway_hardware_defaults_are_flagged(self, site_dir, logger, monkeypatch, caplog):
+        monkeypatch.setattr(module, "detect_hardware_serial", lambda: None)
+        h = module.UDMIHandler(logger, RESOURCES_DIR, str(site_dir), config_wait_timeout_sec=0)
+        with caplog.at_level(logging.WARNING):
+            h.register_gateway("CGW-2", proxy_ids=[], serial_no="S1")
+        assert "site_details.hardware" in caplog.text
+
+        caplog.clear()
+        h = module.UDMIHandler(logger, RESOURCES_DIR, str(site_dir), config_wait_timeout_sec=0)
+        with caplog.at_level(logging.WARNING):
+            h.register_gateway("CGW-2", proxy_ids=[], serial_no="S1", hardware={"make": "Moxa", "model": "UC-8210"})
+        assert "site_details.hardware" not in caplog.text
+        assert _state(h, "CGW-2")["system"]["hardware"] == {"make": "Moxa", "model": "UC-8210"}
 
 
 class TestLocalnet:
@@ -427,3 +442,12 @@ class TestEnumeration:
         blob = _state(h, "CGW-2")["blobset"]["blobs"]["_firmware_update"]
         assert blob["phase"] == "final"
         assert blob["status"]["level"] == LEVEL_ERROR
+
+    def test_unsupported_alarms_carry_a_status_each(self, handler_factory):
+        h = handler_factory()
+        h.handle_config("EM-11", _config("2026-11-04T10:00:00Z", alarmset={"alarms": {"over_voltage": {}}}))
+        alarm = _state(h, "EM-11")["alarmset"]["alarms"]["over_voltage"]
+        assert alarm["value_state"] == "invalid"
+        assert alarm["status"]["category"] == CATEGORY_SYSTEM_CONFIG_APPLY
+        assert alarm["status"]["level"] == LEVEL_ERROR
+        assert "over_voltage" in alarm["status"]["message"]
