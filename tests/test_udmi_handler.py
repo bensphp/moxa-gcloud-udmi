@@ -21,7 +21,6 @@ from google_iot_core_gateway.udmi_handler.udmi_handler import (
     GATEWAY_FEATURES,
     LEVEL_DEBUG,
     LEVEL_ERROR,
-    LEVEL_INFO,
     LEVEL_WARNING,
     PROXY_FEATURES,
     parse_modbus_ref,

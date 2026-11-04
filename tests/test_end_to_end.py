@@ -29,30 +29,51 @@ pytestmark = pytest.mark.skipif(not os.path.exists(MOSQUITTO), reason="mosquitto
 PREFIX = "/r/UK-LON-GLAB/d"
 
 
-def _wait_port(port, timeout=10.0):
+def _wait_port(port, proc=None, timeout=10.0) -> bool:
+    """True once `port` accepts connections; False if `proc` exits first or the timeout expires."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
+        if proc is not None and proc.poll() is not None:
+            return False
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=0.3):
-                return
+                return True
         except OSError:
             time.sleep(0.05)
-    raise RuntimeError(f"port {port} not ready")
+    return False
 
 
-def _start_broker(tmp_path, port):
-    conf = tmp_path / f"mosquitto-{port}.conf"
-    store = tmp_path / f"mosquitto-{port}-store"
-    store.mkdir(exist_ok=True)
-    # Persistence keeps the observer's session (and queued QoS 1 messages) across broker restarts.
-    conf.write_text(
-        f"listener {port} 127.0.0.1\nallow_anonymous true\n"
-        f"persistence true\npersistence_location {store}/\n",
-        encoding="utf-8",
-    )
-    proc = subprocess.Popen([MOSQUITTO, "-c", str(conf)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    _wait_port(port)
-    return proc
+def _start_broker(tmp_path, port=None, extra_conf="", attempts=5):
+    """Start mosquitto and return (process, port).
+
+    find_free_port() can only pick a port, not reserve it: another process may take it before
+    mosquitto binds it. Mosquitto then exits ("Address already in use"), so try again, on a new
+    port unless the caller needs a specific one (broker restart). Keep the broker output so that a
+    failed start says why.
+    """
+    output = ""
+    for _attempt in range(attempts):
+        use_port = port if port is not None else find_free_port()
+        conf = tmp_path / f"mosquitto-{use_port}.conf"
+        store = tmp_path / f"mosquitto-{use_port}-store"
+        store.mkdir(exist_ok=True)
+        # Persistence keeps the observer's session (and queued QoS 1 messages) across broker restarts.
+        conf.write_text(
+            f"listener {use_port} 127.0.0.1\nallow_anonymous true\n"
+            f"persistence true\npersistence_location {store}/\n{extra_conf}",
+            encoding="utf-8",
+        )
+        log_path = tmp_path / f"mosquitto-{use_port}.log"
+        with open(log_path, "ab") as log:
+            proc = subprocess.Popen([MOSQUITTO, "-c", str(conf)], stdout=log, stderr=subprocess.STDOUT)
+        if _wait_port(use_port, proc):
+            return proc, use_port
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=5)
+        output = log_path.read_text(encoding="utf-8", errors="replace").strip()
+        time.sleep(0.2)
+    raise RuntimeError(f"mosquitto did not start after {attempts} attempts: {output[-500:]}")
 
 
 class Observer:
@@ -132,8 +153,7 @@ def _base_config(ts, **blocks):
 
 @pytest.fixture
 def broker(tmp_path):
-    port = find_free_port()
-    proc = _start_broker(tmp_path, port)
+    proc, port = _start_broker(tmp_path)
     state = {"proc": proc, "port": port}
     yield state
     if state["proc"].poll() is None:
@@ -191,7 +211,7 @@ def test_gateway_loop_end_to_end_and_state_resent_after_reconnect(tmp_path, brok
         generation = publisher.connection_generation
         broker["proc"].terminate()
         broker["proc"].wait(timeout=5)
-        broker["proc"] = _start_broker(tmp_path, port)
+        broker["proc"], _port = _start_broker(tmp_path, port)
         deadline = time.monotonic() + 20
         while publisher.connection_generation == generation and time.monotonic() < deadline:
             time.sleep(0.1)
@@ -319,17 +339,13 @@ def test_tls_connection_verifies_the_broker(tmp_path, logger, caplog):
     _other_key, other_ca = _make_ca("Unrelated CA")
     (tmp_path / "other-ca.crt").write_bytes(other_ca.public_bytes(serialization.Encoding.PEM))
 
-    port = find_free_port()
-    conf = tmp_path / "tls.conf"
-    conf.write_text(
-        f"listener {port} 127.0.0.1\nallow_anonymous true\ncafile {tmp_path / 'ca.crt'}\n"
-        f"certfile {tmp_path / 'server.crt'}\nkeyfile {tmp_path / 'server.key'}\n",
-        encoding="utf-8",
+    tls_conf = (
+        f"cafile {tmp_path / 'ca.crt'}\n"
+        f"certfile {tmp_path / 'server.crt'}\nkeyfile {tmp_path / 'server.key'}\n"
     )
-    broker = subprocess.Popen([MOSQUITTO, "-c", str(conf)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    tls_broker, port = _start_broker(tmp_path, extra_conf=tls_conf)
     publishers = []
     try:
-        _wait_port(port)
 
         def _publisher(ca_file, host="localhost"):
             pub = GoogleIoTCoreMQTTPublisher(
@@ -354,5 +370,5 @@ def test_tls_connection_verifies_the_broker(tmp_path, logger, caplog):
     finally:
         for pub in publishers:
             pub.close()
-        broker.terminate()
-        broker.wait(timeout=5)
+        tls_broker.terminate()
+        tls_broker.wait(timeout=5)

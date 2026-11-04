@@ -76,8 +76,10 @@ Telemetry health:
 - **Gateway proxying**: attaches the configured proxies, follows `gateway.proxy_ids` changes (ids
   that are not configured locally are reported as `gateway.setup.attach`), validates
   `gateway.target` (family `modbus`, address = configured `port`/unit id, `unitid`) and surfaces
-  cloud `errors` topic messages (e.g. attach failures) as `gateway.setup.attach` status; these clear
-  on reconnect, when the proxy receives its config, or after 10 minutes without recurrence.
+  cloud `errors` topic messages (e.g. attach failures) as `gateway.setup.attach` status. An error
+  for a configured proxy clears when that proxy receives its config, when it is removed from
+  `proxy_ids`, or when a new MQTT session starts (errors reported on the new session are kept);
+  errors for any other target clear after 10 minutes without recurrence.
 - **Point references** follow the UDMI Modbus grammar:
   `<function>/<address>[/<quantity>][?type=..&worder=..&border=..]` when the site model gives the unit
   id (`localnet.families.modbus.unitid`, else `gateway.target.unitid`), otherwise prefixed with

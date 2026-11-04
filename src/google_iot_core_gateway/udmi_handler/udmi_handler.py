@@ -61,7 +61,7 @@ DEFAULT_METRICS_RATE_SEC = 10  # config_system.json default; 0 disables metrics
 HEALTH_TICK_SEC = 1.0
 LOCALNET_REFRESH_SEC = 60.0
 MAX_PENDING_LOGS = 200
-ATTACH_ERROR_TTL_SEC = 600.0  # cloud attach errors clear if they do not recur for 10 minutes
+ATTACH_ERROR_TTL_SEC = 600.0  # errors for targets that are not configured proxies expire after 10 minutes
 UNKNOWN_SERIAL = "unknown"
 
 MODE_INITIAL = "initial"

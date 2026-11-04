@@ -24,6 +24,10 @@
   "site_details": {
     "gateway_id": "CGW-2",
     "serial_no": "REPLACE-WITH-UC8220-SERIAL",
+    "hardware": {
+      "make": "Moxa",
+      "model": "UC8220"
+    },
     "proxy_ids": {
       "EM-11": {
         "type": "PM5561",

@@ -6,6 +6,7 @@ import datetime
 import json
 import logging
 import queue
+import ssl
 import threading
 import types
 
@@ -19,6 +20,7 @@ from google_iot_core_gateway.errors import GatewayConfigError
 from google_iot_core_gateway.gcp_handler import process_payloads
 from google_iot_core_gateway.udmi_handler import udmi_handler as module
 from google_iot_core_gateway.utils.config_handler import ConfigHandler, redact_secrets
+from google_iot_core_gateway.utils.jwt_handler import create_jwt
 from helpers import RecordingClient, make_publisher, write_rsa_key
 
 
@@ -68,6 +70,21 @@ def test_jwt_lifetime_is_validated(tmp_path, minutes, ok):
     else:
         with pytest.raises(GatewayConfigError, match="jwt_expires_minutes"):
             load()
+
+
+@pytest.mark.parametrize("requested,lifetime_sec", [(0, 60), (10**6, 1440 * 60)])
+def test_jwt_handler_clamps_the_lifetime(logger, tmp_path, requested, lifetime_sec):
+    """Defence in depth behind the config validation: a token never outlives the 24 h maximum."""
+    token, _expiry = create_jwt(logger, "proj", write_rsa_key(tmp_path), "RS256", expires_minutes=requested)
+    claims = jwt.decode(token, options={"verify_signature": False})
+    assert claims["exp"] - claims["iat"] == lifetime_sec
+
+
+def test_tls_context_requires_verified_tls_1_2_or_newer(logger):
+    context = make_publisher(logger, enable_tls=True)._build_tls_context()
+    assert context.minimum_version in (ssl.TLSVersion.TLSv1_2, ssl.TLSVersion.TLSv1_3)
+    assert context.verify_mode == ssl.CERT_REQUIRED
+    assert context.check_hostname
 
 
 def test_secrets_are_redacted_from_config_logs(tmp_path, caplog):
