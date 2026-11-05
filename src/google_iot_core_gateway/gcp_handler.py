@@ -4,7 +4,6 @@ import argparse
 import json
 import os
 import queue
-import signal
 import threading
 import time
 from queue import Empty
@@ -18,6 +17,7 @@ from google_iot_core_gateway.internal_broker_subscriber.internal_broker_subscrib
     MosquittoMQTTSubscriber,
 )
 from google_iot_core_gateway.modbus_gw.modbus_to_json import modbus_to_json
+from google_iot_core_gateway.runner import run_gateway_process
 from google_iot_core_gateway.udmi_handler.udmi_handler import UDMIHandler
 from google_iot_core_gateway.utils.certificates_handler import (
     get_gateway_private_key,
@@ -547,16 +547,19 @@ def start_google_iot_core_gateway(logger, args, root_dir=None, stop_event=None):
 
 
 def start_standalone_google_iot_core_gateway(assigned_args=None, logger=None, stop_event=None):
-    """Standalone entry point for `python -m google_iot_core_gateway` (same exit codes as main.py)."""
+    """Standalone entry point for `python -m google_iot_core_gateway` (same behaviour as main.py)."""
     args = parse_command_line_args(
         args=assigned_args, parents=[get_google_cloud_cmd_line_parser()]
     )
     if not logger:
         logger = setup_logger()
     if stop_event is None and threading.current_thread() is threading.main_thread():
+        # Same process model as main.py: the gateway runs in a worker thread that never receives
+        # SIGINT/SIGTERM, and this thread turns them into a clean shutdown.
         stop_event = threading.Event()
-        for signum in (signal.SIGINT, signal.SIGTERM):
-            signal.signal(signum, lambda _signum, _frame: stop_event.set())
+        return run_gateway_process(
+            logger, lambda: start_google_iot_core_gateway(logger, args, stop_event=stop_event), stop_event
+        )
     return start_google_iot_core_gateway(logger, args, stop_event=stop_event)
 
 

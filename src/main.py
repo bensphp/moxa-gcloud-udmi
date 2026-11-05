@@ -11,7 +11,6 @@ Exit codes: 0 = clean shutdown, 1 = fatal error, 192 = restart requested via UDM
 """
 
 import argparse
-import signal
 import sys
 import threading
 from pathlib import Path
@@ -21,18 +20,15 @@ _SRC_DIR = str(Path(__file__).resolve().parent)
 if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
 
-from app_data import app_data  # noqa: E402
 from google_iot_core_gateway import ROOT_DIR, __version__ as version  # noqa: E402
-from google_iot_core_gateway.errors import EXIT_FATAL  # noqa: E402
 from google_iot_core_gateway.gcp_handler import (  # noqa: E402
     get_google_cloud_cmd_line_parser,
     start_google_iot_core_gateway,
 )
+from google_iot_core_gateway.runner import run_gateway_process  # noqa: E402
 from google_iot_core_gateway.utils.log import setup_logger  # noqa: E402
 
 logger = setup_logger()
-
-SHUTDOWN_GRACE_SEC = 15.0
 
 
 def get_internal_broker_cmd_line_parser() -> argparse.ArgumentParser:
@@ -91,40 +87,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
 
     stop_event = threading.Event()
-    result = {"exit_code": EXIT_FATAL}
-
-    def _handle_signal(signum, _frame):
-        logger.info(f"Received signal {signum}; shutting down gateway...")
-        stop_event.set()
-
-    signal.signal(signal.SIGINT, _handle_signal)
-    signal.signal(signal.SIGTERM, _handle_signal)
-
-    def _run_gateway():
-        try:
-            result["exit_code"] = start_google_iot_core_gateway(
-                logger, parsed_args, ROOT_DIR, stop_event
-            )
-        except SystemExit as exc:
-            result["exit_code"] = exc.code if isinstance(exc.code, int) else EXIT_FATAL
-        except BaseException:  # noqa: BLE001 - report any crash through the exit code
-            logger.exception("Gateway thread crashed")
-            result["exit_code"] = EXIT_FATAL
-
-    thread_google_bos_gateway = threading.Thread(target=_run_gateway, daemon=True)
-    app_data.thread_google_bos_gw = thread_google_bos_gateway
-
-    thread_google_bos_gateway.start()
-    logger.info(f"MQTT Google IoT Core Gateway {version} started")
-    while thread_google_bos_gateway.is_alive() and not stop_event.is_set():
-        thread_google_bos_gateway.join(timeout=0.5)
-    if thread_google_bos_gateway.is_alive():
-        # Shutdown requested: give the worker time to disconnect cleanly.
-        thread_google_bos_gateway.join(timeout=SHUTDOWN_GRACE_SEC)
-        if thread_google_bos_gateway.is_alive():
-            logger.error("Gateway did not stop within %.0f s; exiting anyway", SHUTDOWN_GRACE_SEC)
-            return EXIT_FATAL
-    return result["exit_code"]
+    logger.info(f"MQTT Google IoT Core Gateway {version} starting")
+    # The gateway runs in a worker thread that never receives SIGINT/SIGTERM; this (main) thread
+    # turns them into a clean shutdown (see runner.py).
+    return run_gateway_process(
+        logger,
+        lambda: start_google_iot_core_gateway(logger, parsed_args, ROOT_DIR, stop_event),
+        stop_event,
+    )
 
 
 if __name__ == "__main__":

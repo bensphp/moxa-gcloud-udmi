@@ -110,7 +110,9 @@ moxa-gcloud-udmi/
 ├── src/
 │   ├── main.py                           # Entry point (exit codes 0 / 1 / 192)
 │   └── google_iot_core_gateway/
-│       ├── gcp_handler.py                # Main loop
+│       ├── runner.py                     # Process model: worker thread, signals, exit codes
+│       ├── errors.py                     # Exit codes and configuration errors
+│       ├── gcp_handler.py                # Start-up and main loop
 │       ├── gcp_publisher.py              # Cloud / UDMI MQTT client
 │       ├── internal_broker_subscriber/   # Local MXcloudgate broker subscriber
 │       ├── modbus_gw/                    # Modbus RTU frame decoder
@@ -193,8 +195,9 @@ sudo systemctl enable --now moxa-gcloud-udmi
 journalctl -u moxa-gcloud-udmi -f
 ```
 
-Exit codes (also for `python3 -m google_iot_core_gateway`): `0` clean shutdown (SIGTERM/SIGINT),
-`1` fatal error, `192` UDMI restart request.
+Exit codes (also for `python3 -m google_iot_core_gateway`): `0` clean shutdown (SIGTERM/SIGINT,
+also during start-up), `1` fatal error, `192` UDMI restart request. The gateway runs in a worker
+thread that never receives SIGTERM/SIGINT; the main thread turns them into a clean stop.
 
 For a local UDMI broker:
 ```bash
