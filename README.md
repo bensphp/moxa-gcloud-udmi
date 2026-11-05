@@ -195,9 +195,11 @@ sudo systemctl enable --now moxa-gcloud-udmi
 journalctl -u moxa-gcloud-udmi -f
 ```
 
-Exit codes (also for `python3 -m google_iot_core_gateway`): `0` clean shutdown (SIGTERM/SIGINT,
-also during start-up), `1` fatal error, `192` UDMI restart request. The gateway runs in a worker
-thread that never receives SIGTERM/SIGINT; the main thread turns them into a clean stop.
+Exit codes (also for `python3 -m google_iot_core_gateway`): `0` clean shutdown on SIGTERM/SIGINT,
+also during start-up once Python has imported the gateway (a signal in the first instants after
+launch ends the process directly; systemd counts that as a clean stop too), `1` fatal error, `192`
+UDMI restart request. The gateway runs in a worker thread that never receives SIGTERM/SIGINT; the
+main thread turns them into a clean stop.
 
 For a local UDMI broker:
 ```bash
