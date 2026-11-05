@@ -24,6 +24,8 @@ ExecStart=/usr/bin/python3 /home/moxa/moxa-gcloud-udmi/src/main.py -c /home/moxa
 StateDirectory=moxa-gcloud-udmi
 Restart=always
 RestartSec=10
+# A UDMI restart (exit 192) is intended: restart without marking the unit failed.
+SuccessExitStatus=192
 TimeoutStopSec=20
 KillSignal=SIGTERM
 
