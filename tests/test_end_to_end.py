@@ -23,6 +23,7 @@ from google_iot_core_gateway.internal_broker_subscriber.internal_broker_subscrib
     MosquittoMQTTSubscriber,
 )
 from google_iot_core_gateway.udmi_handler.udmi_handler import UDMIHandler
+import frame_report
 import mxcloudgate_simulator as sim
 
 pytestmark = pytest.mark.skipif(not os.path.exists(MOSQUITTO), reason="mosquitto not installed")
@@ -372,3 +373,35 @@ def test_tls_connection_verifies_the_broker(tmp_path, logger, caplog):
             pub.close()
         tls_broker.terminate()
         tls_broker.wait(timeout=5)
+
+
+def test_frame_report_listens_to_the_internal_broker(tmp_path, broker):
+    """tools/frame_report.py --live: captures real MQTT traffic, saves it, and reports READY."""
+    port = broker["port"]
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps({
+        "internal_broker": {"mqtt_bridge_hostname": "127.0.0.1", "mqtt_bridge_port": port},
+        "site_details": {"proxy_ids": {"EM-11": {"type": "PM5561", "modbus_slave_id": 1}}},
+        "environment_setup": {"resources_path": RESOURCES_DIR},
+    }), encoding="utf-8")
+    observer = Observer(port)
+    stop = threading.Event()
+
+    def _publish():
+        while not stop.is_set():
+            _publish_frames(observer)
+            stop.wait(0.3)
+
+    publisher = threading.Thread(target=_publish, daemon=True)
+    publisher.start()
+    saved = tmp_path / "capture.jsonl"
+    try:
+        rc = frame_report.main(["-c", str(config), "--live", "3", "--save", str(saved)])
+    finally:
+        stop.set()
+        publisher.join(timeout=5)
+        observer.close()
+    assert rc == frame_report.EXIT_READY
+    assert len(saved.read_text(encoding="utf-8").splitlines()) >= 8  # every EM-11 block at least once
+    assert frame_report.main(["-c", str(config), str(saved)]) == frame_report.EXIT_READY
+

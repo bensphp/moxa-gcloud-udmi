@@ -1,3 +1,6 @@
 paho-mqtt>=1.6.1,<3.0.0
 PyJWT>=2.4.0
-cryptography>=36.0.0
+# 3.3.x (Debian 11's python3-cryptography, or what earlier versions of this gateway installed) is the
+# oldest tested version and is accepted as installed. armv7l (UC-8220) wheels on PyPI start at 44.0.1
+# and need glibc 2.31+; elsewhere pip would have to build a newer release from source (Rust).
+cryptography>=3.3.1

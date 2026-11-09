@@ -121,7 +121,9 @@ moxa-gcloud-udmi/
 │       └── gcp_manager.py                # Legacy Cloud IoT Core provisioning helper (not used by
 │                                         # the gateway; needs the retired google-cloud-iot package)
 ├── tests/                                # pytest suite (unit + live Mosquitto end-to-end)
-├── tools/mxcloudgate_simulator.py        # MXcloudgate frame simulator with fault injection
+├── tools/
+│   ├── frame_report.py                   # Pre-deployment check of real MXcloudgate traffic
+│   └── mxcloudgate_simulator.py          # MXcloudgate frame simulator with fault injection
 └── udmi_site_model/                      # Site model templates (see Site Model Requirements)
 ```
 
@@ -133,6 +135,26 @@ git clone https://github.com/MEUIIOT/moxa-gcloud-udmi.git
 cd moxa-gcloud-udmi
 python3 -m pip install -r requirements.txt
 ```
+
+Tested with Python 3.9 and 3.13, paho-mqtt 1.6.1 and 2.1, PyJWT 2.4 and 2.15, cryptography 3.3.2 and
+50. An installed `cryptography` 3.3.x (Debian 11's `python3-cryptography`, or the one an earlier
+version of this gateway installed) is accepted, so pip only adds the pure-Python packages. On the
+UC-8220 (armv7l), newer `cryptography` wheels need glibc 2.31+ (Debian 11) and pip 20.3+; otherwise
+pip would build from source (Rust). Without internet access on the gateway, download the wheels
+elsewhere and install them offline:
+```bash
+pip download -d wheels --python-version 3.9 --only-binary=:all: \
+  "paho-mqtt>=1.6.1,<3" "PyJWT>=2.4.0" "typing_extensions>=4.0"
+python3 -m pip install --no-index --find-links wheels -r requirements.txt   # on the gateway
+```
+
+Before the first deployment, check the real MXcloudgate traffic (listens only, publishes nothing):
+```bash
+python3 tools/frame_report.py -c resources/config-google-gateway.json --live 300 --save frames.jsonl
+```
+It reports CRC validity (whether `modbus.crc_check` can stay `strict`), the polled register blocks,
+whether the meter identity registers and all register-map points are polled, "not available"
+registers and sample values to compare with the meter display. Exit status 0 means ready.
 
 ## Configuration
 `resources/config-google-gateway.json` (see `resources/config-cgw2-example.json`):
