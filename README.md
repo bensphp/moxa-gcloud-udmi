@@ -136,8 +136,8 @@ cd moxa-gcloud-udmi
 python3 -m pip install -r requirements.txt
 ```
 
-Tested with Python 3.9 and 3.13, paho-mqtt 1.6.1 and 2.1, PyJWT 2.4 and 2.15, cryptography 3.3.2 and
-50. An installed `cryptography` 3.3.x (Debian 11's `python3-cryptography`, or the one an earlier
+Tested with Python 3.9 and 3.13, paho-mqtt 1.6.1 and 2.1, PyJWT 2.4 and 2.15, cryptography 3.3.1,
+3.3.2 and 50. An installed `cryptography` 3.3.x (Debian 11's `python3-cryptography`, or the one an earlier
 version of this gateway installed) is accepted, so pip only adds the pure-Python packages. On the
 UC-8220 (armv7l), newer `cryptography` wheels need glibc 2.31+ (Debian 11) and pip 20.3+; otherwise
 pip would build from source (Rust). Without internet access on the gateway, download the wheels
@@ -146,6 +146,14 @@ elsewhere and install them offline:
 pip download -d wheels --python-version 3.9 --only-binary=:all: \
   "paho-mqtt>=1.6.1,<3" "PyJWT>=2.4.0" "typing_extensions>=4.0"
 python3 -m pip install --no-index --find-links wheels -r requirements.txt   # on the gateway
+```
+
+On a gateway that still runs an older version, install into a virtual environment that reuses the
+installed `cryptography`, so the older version's packages stay exactly as they are (rolling back is
+then just starting it again); use `.venv/bin/python` in the commands and in the unit's `ExecStart`:
+```bash
+python3 -m venv --system-site-packages .venv      # Debian: needs the python3-venv package
+.venv/bin/python -m pip install -r requirements.txt
 ```
 
 Before the first deployment, check the real MXcloudgate traffic (listens only, publishes nothing):
