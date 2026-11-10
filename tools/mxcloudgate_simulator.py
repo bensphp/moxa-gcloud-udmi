@@ -43,7 +43,7 @@ MAX_BLOCK_GAP = 16
 DEFAULT_IDENTITIES = {
     1: {
         "type": "PM5561",
-        "serial_no": 52110011,
+        "serial_no": 52110001,
         "firmware_version": 1103,
         "manufacturer_name": "Schneider Electric",
         "model_name": "PM5561",
@@ -51,7 +51,7 @@ DEFAULT_IDENTITIES = {
     },
     2: {
         "type": "PM5111",
-        "serial_no": 51110012,
+        "serial_no": 51110002,
         "firmware_version": 1203,
         "manufacturer_name": "Schneider Electric",
         "model_name": "PM5111",
@@ -59,7 +59,7 @@ DEFAULT_IDENTITIES = {
     },
     3: {
         "type": "PM8240",
-        "serial_no": "PM8240-0013",
+        "serial_no": "PM8240-0003",
         "firmware_version": "2.1.0",
         "manufacturer_name": "Schneider Electric",
         "model_name": "PM8240",

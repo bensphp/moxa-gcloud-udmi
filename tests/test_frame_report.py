@@ -58,7 +58,7 @@ def test_complete_valid_traffic_is_ready(tmp_path, capsys):
     out = capsys.readouterr().out
     assert rc == frame_report.EXIT_READY, out
     assert "READY" in out
-    assert "identity serial_no" in out and "52110011" in out  # EM-1's serial, decoded from the frames
+    assert "identity serial_no" in out and "52110001" in out  # EM-1's serial, decoded from the frames
     assert "sample" in out
 
 

@@ -85,10 +85,10 @@ def test_identity_change_is_published(handler_factory):
     h.handle_config("EM-1", _meter_config())
     now = time.monotonic()
     assert h.pop_due_state_payload("EM-1", now_mono=now) is not None
-    h.record_modbus_payload(_frame({130: 52110011}, start=130, qty=2), now_mono=now + 5)
+    h.record_modbus_payload(_frame({130: 52110001}, start=130, qty=2), now_mono=now + 5)
     payload = h.pop_due_state_payload("EM-1", now_mono=now + 5)
     assert payload is not None
-    assert json.loads(payload)["system"]["serial_no"] == "52110011"
+    assert json.loads(payload)["system"]["serial_no"] == "52110001"
 
 
 def test_rejected_set_value_keeps_publishing_the_reading(handler_factory):

@@ -171,7 +171,7 @@ def test_gateway_loop_end_to_end_and_state_resent_after_reconnect(tmp_path, brok
 
     observer = Observer(port)
     publisher = GoogleIoTCoreMQTTPublisher(
-        logger, {"EM-1": {}}, project_id="local", cloud_region="europe-west1", registry_id="ZZ-TRI-FECTA",
+        logger, {"EM-1": {}}, project_id="local", cloud_region="us-central1", registry_id="ZZ-TRI-FECTA",
         gateway_id="CGW-1", private_key_file=None, ca_cert=None, mqtt_bridge_hostname="127.0.0.1",
         mqtt_bridge_port=port, iot_provider="mqtt", enable_tls=False,
     )
@@ -205,7 +205,7 @@ def test_gateway_loop_end_to_end_and_state_resent_after_reconnect(tmp_path, brok
         assert event is not None
         assert json.loads(event[1])["points"]["line1_neutral_voltage_sensor"]["present_value"] > 200
         observer.wait_for(_state_of("CGW-1", lambda s: s["system"]["last_config"] == "2026-11-04T11:00:00Z"))
-        observer.wait_for(_state_of("EM-1", lambda s: s["system"]["serial_no"] == "52110011"))
+        observer.wait_for(_state_of("EM-1", lambda s: s["system"]["serial_no"] == "52110001"))
 
         # Broker restart: the gateway reconnects on its own and re-sends state.
         mark = observer.mark()
@@ -350,7 +350,7 @@ def test_tls_connection_verifies_the_broker(tmp_path, logger, caplog):
 
         def _publisher(ca_file, host="localhost"):
             pub = GoogleIoTCoreMQTTPublisher(
-                logger, {}, project_id="local", cloud_region="europe-west1", registry_id="ZZ-TRI-FECTA",
+                logger, {}, project_id="local", cloud_region="us-central1", registry_id="ZZ-TRI-FECTA",
                 gateway_id="CGW-1", private_key_file=None, ca_cert=str(ca_file), ca_cert_required=True,
                 mqtt_bridge_hostname=host, mqtt_bridge_port=port, iot_provider="mqtt", enable_tls=True,
             )

@@ -62,7 +62,7 @@ def write_site_model(
     for device in devices:
         (site_dir / "devices" / device).mkdir(parents=True)
     (site_dir / "cloud_iot_config.json").write_text(
-        json.dumps({"cloud_region": "europe-west1", "site_name": "ZZ-TRI-FECTA", "registry_id": "ZZ-TRI-FECTA"}),
+        json.dumps({"cloud_region": "us-central1", "site_name": "ZZ-TRI-FECTA", "registry_id": "ZZ-TRI-FECTA"}),
         encoding="utf-8",
     )
     gateway_meta = {

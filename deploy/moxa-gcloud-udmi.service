@@ -1,4 +1,7 @@
-# systemd unit for moxa-gcloud-udmi on a Moxa UC-8220 (Debian 11).
+# systemd unit for moxa-gcloud-udmi on a Moxa gateway (e.g. UC-8220, Debian 11).
+#
+# It assumes the user `moxa` and a checkout in /home/moxa/moxa-gcloud-udmi: adapt User=,
+# WorkingDirectory= and ExecStart= if your installation differs.
 #
 # Install:
 #   sudo cp deploy/moxa-gcloud-udmi.service /etc/systemd/system/

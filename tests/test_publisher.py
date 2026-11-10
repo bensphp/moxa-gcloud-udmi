@@ -17,7 +17,7 @@ def test_topic_formats(logger, tmp_path):
     assert local._parse_device_topic("/r/ZZ-TRI-FECTA/d/EM-1/config") == ("EM-1", "config")
     cloud = make_publisher(logger, provider="iot_core", private_key_file=write_rsa_key(tmp_path))
     assert cloud._format_device_topic("EM-1", "events/pointset") == "/devices/EM-1/events/pointset"
-    assert cloud._get_client_id() == "projects/proj/locations/europe-west1/registries/ZZ-TRI-FECTA/devices/CGW-1"
+    assert cloud._get_client_id() == "projects/proj/locations/us-central1/registries/ZZ-TRI-FECTA/devices/CGW-1"
 
 
 def test_explicit_ca_must_exist(logger, tmp_path):

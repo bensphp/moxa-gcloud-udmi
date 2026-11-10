@@ -129,8 +129,8 @@ def test_frames_are_routed_to_the_right_meter(tmp_path, logger, monkeypatch):
         for req, resp in sim.build_slave_frames(slave, 1):
             q.put(json.dumps({"rtu_request": req.hex(), "rtu_response": resp.hex()}))
     process_payloads(logger, q, h)
-    assert json.loads(h.get_state_payload("EM-1"))["system"]["serial_no"] == "52110011"
-    assert json.loads(h.get_state_payload("EM-2"))["system"]["serial_no"] == "51110012"
+    assert json.loads(h.get_state_payload("EM-1"))["system"]["serial_no"] == "52110001"
+    assert json.loads(h.get_state_payload("EM-2"))["system"]["serial_no"] == "51110002"
     assert json.loads(h.get_state_payload("EM-2"))["system"]["hardware"]["model"] == "PM5111"
 
 

@@ -9,7 +9,7 @@
   },
   "google_cloud": {
     "iot_provider": "iot_core",
-    "cloud_region": "your-cloud-region",
+    "cloud_region": "us-central1",
     "project_id": "your-project-id",
     "sample_rate_set": 10,
     "mqtt_bridge_hostname": "your-mqtt-hostname",

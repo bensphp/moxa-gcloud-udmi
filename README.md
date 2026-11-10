@@ -26,7 +26,24 @@ proxied meters (e.g. `EM-1`..`EM-3`), towards a **Cloud IoT Core compatible MQTT
 (`/devices/{id}/...` topics, JWT authentication) or a **UDMI MQTT broker**
 (`/r/{registry}/d/{id}/...` topics).
 
-![image](https://github.com/user-attachments/assets/0a59dbb3-8941-408a-9212-7d70b7078d9e)
+```mermaid
+flowchart LR
+    M["MXcloudgate (Modbus gateway)"]
+    B["Local MQTT broker"]
+    C["Cloud IoT Core compatible bridge or UDMI MQTT broker"]
+    subgraph G["moxa-gcloud-udmi"]
+        D["Modbus decoder"] --> U["UDMI state, config and events"]
+    end
+    M -->|"raw Modbus RTU request/response"| B
+    B -->|"topic MXcloudgate"| D
+    U -->|"state, events"| C
+    C -->|"config"| U
+```
+
+Each message on the local broker carries one request/response pair as hex strings:
+```json
+{"rtu_request": "020336e200026b86", "rtu_response": "02030400000000c933"}
+```
 
 ## Data Integrity Rules
 The gateway reports what the devices actually say. The UDMI site model is used for configuration
@@ -207,9 +224,10 @@ describe the real installation:
     `enumeration.features`, `enumeration.pointset` (beta).
 
 The templates in `udmi_site_model/` (gateway `CGW-1` with meters `EM-1`..`EM-3`) follow these rules.
-Their site name (`ZZ-TRI-FECTA`, the UDMI reference site) and cloud region, the meter identities
-(serial numbers and firmware, which are those of `tools/mxcloudgate_simulator.py`) and the gateway
-serial number, model and addresses are placeholders to replace with the real values. No device
+Their site name (`ZZ-TRI-FECTA`, the UDMI reference site) and cloud region, the asset GUIDs and
+positions, the meter identities (serial numbers and firmware, which are those of
+`tools/mxcloudgate_simulator.py`) and the gateway serial number, model and addresses are
+placeholders to replace with the real values. No device
 keys are shipped: generate them per installation (e.g. with the UDMI `bin/keygen` tool); the UDMI
 registrar reports the gateway as incomplete until its key exists.
 
@@ -220,7 +238,8 @@ python3 src/main.py -c resources/config-google-gateway.json
 
 For production use the bundled systemd unit; `Restart=always` is required for UDMI restarts, and
 the unit keeps retrying every 10 s (also after configuration errors, so the gateway recovers on its
-own once the configuration is fixed):
+own once the configuration is fixed). The unit assumes the user `moxa` and a checkout in
+`/home/moxa/moxa-gcloud-udmi`; adapt `User`, `WorkingDirectory` and `ExecStart` otherwise:
 ```bash
 sudo cp deploy/moxa-gcloud-udmi.service /etc/systemd/system/
 sudo systemctl daemon-reload
