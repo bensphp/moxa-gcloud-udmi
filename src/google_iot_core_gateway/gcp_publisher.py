@@ -1,6 +1,6 @@
 # This software is licensed under GNU GENERAL PUBLIC LICENSE Version 3, 29 June 2007
 
-"""MQTT client for ClearBlade / Cloud IoT Core style brokers and local UDMI MQTT brokers.
+"""MQTT client for Cloud IoT Core compatible bridges and UDMI MQTT brokers.
 
 One paho client is used for the lifetime of the process. Reconnection is handled by paho's own
 exponential backoff (1 s .. 120 s, UDMI `mqtt_client.md`), so unacknowledged QoS 1 messages stay
@@ -66,7 +66,7 @@ class GoogleIoTCoreMQTTPublisher:
         mqtt_bridge_hostname,
         mqtt_bridge_port,
         jwt_signing_algorithm="RS256",
-        iot_provider="gbos",
+        iot_provider="iot_core",
         enable_tls=True,
         client_cert=None,
         client_key=None,
@@ -94,7 +94,7 @@ class GoogleIoTCoreMQTTPublisher:
         self._client_key = client_key
         self._mqtt_bridge_hostname = mqtt_bridge_hostname
         self._mqtt_bridge_port = int(mqtt_bridge_port)
-        self._iot_provider = (iot_provider or "gbos").lower()
+        self._iot_provider = (iot_provider or "iot_core").lower()
         self._enable_tls = bool(enable_tls)
         self._mqtt_username = mqtt_username
         self._mqtt_password = mqtt_password

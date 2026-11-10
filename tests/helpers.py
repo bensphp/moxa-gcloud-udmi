@@ -19,7 +19,7 @@ def config(ts, **blocks):
     return json.dumps(cfg)
 
 
-def em11_config(ts="2026-11-04T10:00:00Z", points=None, target=None, rate=10):
+def meter_config(ts="2026-11-04T10:00:00Z", points=None, target=None, rate=10):
     return config(
         ts,
         gateway={"target": target or {"family": "modbus"}},
@@ -61,7 +61,7 @@ def exception_reply(code, start, qty, slave=1):
     }
 
 
-def state_of(handler, device="EM-11"):
+def state_of(handler, device="EM-1"):
     return json.loads(handler.get_state_payload(device))
 
 
@@ -85,11 +85,11 @@ class RecordingClient:
 def make_publisher(logger, provider="mqtt", **kwargs):
     defaults = dict(
         logger=logger,
-        connected_devices={"EM-11": {}, "EM-12": {}},
+        connected_devices={"EM-1": {}, "EM-2": {}},
         project_id="proj",
         cloud_region="europe-west1",
-        registry_id="UK-LON-GLAB",
-        gateway_id="CGW-2",
+        registry_id="ZZ-TRI-FECTA",
+        gateway_id="CGW-1",
         private_key_file=None,
         ca_cert=None,
         mqtt_bridge_hostname="127.0.0.1",

@@ -1,26 +1,26 @@
 {
   "version": "1.5.2",
-  "timestamp": "2024-09-23T10:46:31Z",
+  "timestamp": "2020-05-01T13:39:07Z",
   "system": {
     "location": {
-      "site": "UK-LON-GLAB",
-      "section": "GLAB"
+      "site": "ZZ-TRI-FECTA",
+      "section": "1"
     },
     "physical_tag": {
       "asset": {
         "guid": "guid://a8159395-2d69-4480-8252-8b678f6813da",
-        "site": "UK-LON-GLAB",
+        "site": "ZZ-TRI-FECTA",
         "name": "CGW-1"
       }
     },
     "hardware": {
       "make": "Moxa",
-      "model": "UC8220"
+      "model": "UC-8220"
     },
     "software": {
       "firmware": "4.3.1"
     },
-    "serial_no": "CGW1-UC8220-001"
+    "serial_no": "REPLACE-WITH-GATEWAY-SERIAL"
   },
   "gateway": {
     "proxy_ids": [

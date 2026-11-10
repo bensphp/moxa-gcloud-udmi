@@ -33,9 +33,9 @@ def _write_unreachable_config(tmp_path):
         "internal_broker": {"mqtt_bridge_hostname": "127.0.0.1", "mqtt_bridge_port": unreachable},
         "google_cloud": {"iot_provider": "mqtt", "mqtt_bridge_hostname": "127.0.0.1",
                          "mqtt_bridge_port": unreachable, "enable_tls": False},
-        "site_details": {"gateway_id": "CGW-2", "serial_no": "CGW2-SIGNALS",
-                         "hardware": {"make": "Moxa", "model": "UC8220"},
-                         "proxy_ids": {"EM-11": {"type": "PM5561", "modbus_slave_id": 1, "port": "ttyM0"}}},
+        "site_details": {"gateway_id": "CGW-1", "serial_no": "GW-SIGNALS",
+                         "hardware": {"make": "Moxa", "model": "UC-8220"},
+                         "proxy_ids": {"EM-1": {"type": "PM5561", "modbus_slave_id": 1, "port": "ttyM0"}}},
         "environment_setup": {"udmi_site_model_path": str(site_dir), "resources_path": RESOURCES_DIR,
                               "state_dir": str(tmp_path / "state")},
     }), encoding="utf-8")

@@ -3,7 +3,7 @@
 
 # This software is licensed under GNU GENERAL PUBLIC LICENSE Version 3, 29 June 2007
 
-"""Main entry point of Modbus JSON to UDMI Google Cloud IoT Core / ClearBlade Gateway.
+"""Main entry point of the Modbus to UDMI gateway (Cloud IoT Core compatible bridge or UDMI MQTT broker).
 
 Exit codes: 0 = clean shutdown, 1 = fatal error, 192 = restart requested via UDMI
 `system.operation.mode` (run under a supervisor such as the bundled systemd unit with

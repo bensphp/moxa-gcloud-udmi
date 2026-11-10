@@ -1,10 +1,10 @@
 {
   "version": "1.5.2",
-  "timestamp": "2024-09-23T10:46:31Z",
+  "timestamp": "2020-05-01T13:39:07Z",
   "system": {
     "location": {
-      "site": "UK-LON-GLAB",
-      "section": "GLAB",
+      "site": "ZZ-TRI-FECTA",
+      "section": "1",
       "position": {
         "x": 111.0,
         "y": 102.3
@@ -13,7 +13,7 @@
     "physical_tag": {
       "asset": {
         "guid": "guid://d26e6ef5-8ad6-4910-8aca-dd502b0586b9",
-        "site": "UK-LON-GLAB",
+        "site": "ZZ-TRI-FECTA",
         "name": "EM-2"
       }
     },

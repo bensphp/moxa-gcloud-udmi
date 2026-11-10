@@ -25,7 +25,7 @@ from helpers import RecordingClient, make_publisher, write_rsa_key
 
 
 def test_jwt_claims_and_lifetime(logger, tmp_path):
-    publisher = make_publisher(logger, provider="gbos", private_key_file=write_rsa_key(tmp_path),
+    publisher = make_publisher(logger, provider="iot_core", private_key_file=write_rsa_key(tmp_path),
                            jwt_expires_minutes=60)
     token = publisher.client._password.decode() if isinstance(publisher.client._password, bytes) else publisher.client._password
     claims = jwt.decode(token, options={"verify_signature": False})
@@ -35,7 +35,7 @@ def test_jwt_claims_and_lifetime(logger, tmp_path):
 
 def test_short_jwt_lifetimes_do_not_cause_a_refresh_storm(logger, tmp_path):
     # 5-minute tokens (now rejected by config validation) used to storm: margin 300 s >= lifetime.
-    publisher = make_publisher(logger, provider="gbos", private_key_file=write_rsa_key(tmp_path),
+    publisher = make_publisher(logger, provider="iot_core", private_key_file=write_rsa_key(tmp_path),
                                jwt_expires_minutes=5)
     calls = []
     original = publisher._refresh_jwt_credentials
@@ -60,7 +60,7 @@ def test_jwt_lifetime_is_validated(tmp_path, minutes, ok):
     cfg = tmp_path / "cfg.json"
     cfg.write_text(json.dumps({
         "google_cloud": {"jwt_expires_minutes": minutes},
-        "site_details": {"gateway_id": "CGW-2", "proxy_ids": {"EM-11": {"type": "PM5561", "modbus_slave_id": 1}}},
+        "site_details": {"gateway_id": "CGW-1", "proxy_ids": {"EM-1": {"type": "PM5561", "modbus_slave_id": 1}}},
         "environment_setup": {"udmi_site_model_path": str(site), "resources_path": RESOURCES_DIR,
                               "state_dir": str(tmp_path / "state")},
     }))
@@ -92,7 +92,7 @@ def test_secrets_are_redacted_from_config_logs(tmp_path, caplog):
     cfg = tmp_path / "cfg.json"
     cfg.write_text(json.dumps({
         "google_cloud": {"iot_provider": "mqtt", "mqtt_password": "s3cr3t-value"},
-        "site_details": {"gateway_id": "CGW-2", "proxy_ids": {"EM-11": {"type": "PM5561", "modbus_slave_id": 1}}},
+        "site_details": {"gateway_id": "CGW-1", "proxy_ids": {"EM-1": {"type": "PM5561", "modbus_slave_id": 1}}},
         "environment_setup": {"udmi_site_model_path": str(site), "resources_path": RESOURCES_DIR,
                               "state_dir": str(tmp_path / "state")},
     }))
@@ -109,9 +109,9 @@ def test_duplicate_slave_ids_are_rejected(tmp_path):
     site = write_site_model(tmp_path)
     cfg = tmp_path / "cfg.json"
     cfg.write_text(json.dumps({
-        "site_details": {"gateway_id": "CGW-2", "proxy_ids": {
-            "EM-11": {"type": "PM5561", "modbus_slave_id": 1},
-            "EM-12": {"type": "PM5111", "modbus_slave_id": 1}}},
+        "site_details": {"gateway_id": "CGW-1", "proxy_ids": {
+            "EM-1": {"type": "PM5561", "modbus_slave_id": 1},
+            "EM-2": {"type": "PM5111", "modbus_slave_id": 1}}},
         "environment_setup": {"udmi_site_model_path": str(site), "resources_path": RESOURCES_DIR},
     }))
     with pytest.raises(GatewayConfigError, match="modbus_slave_id 1"):
@@ -120,18 +120,18 @@ def test_duplicate_slave_ids_are_rejected(tmp_path):
 
 def test_frames_are_routed_to_the_right_meter(tmp_path, logger, monkeypatch):
     monkeypatch.setattr(module, "detect_hardware_serial", lambda: None)
-    site = write_site_model(tmp_path, with_em12=True)
+    site = write_site_model(tmp_path, with_second_meter=True)
     h = module.UDMIHandler(logger, RESOURCES_DIR, str(site), config_wait_timeout_sec=0)
-    h.add_device_to_dict(1, "EM-11", "PM5561", port="ttyM0")
-    h.add_device_to_dict(2, "EM-12", "PM5111", port="ttyM0")
+    h.add_device_to_dict(1, "EM-1", "PM5561", port="ttyM0")
+    h.add_device_to_dict(2, "EM-2", "PM5111", port="ttyM0")
     q = queue.Queue()
     for slave in (1, 2):
         for req, resp in sim.build_slave_frames(slave, 1):
             q.put(json.dumps({"rtu_request": req.hex(), "rtu_response": resp.hex()}))
     process_payloads(logger, q, h)
-    assert json.loads(h.get_state_payload("EM-11"))["system"]["serial_no"] == "52110011"
-    assert json.loads(h.get_state_payload("EM-12"))["system"]["serial_no"] == "51110012"
-    assert json.loads(h.get_state_payload("EM-12"))["system"]["hardware"]["model"] == "PM5111"
+    assert json.loads(h.get_state_payload("EM-1"))["system"]["serial_no"] == "52110011"
+    assert json.loads(h.get_state_payload("EM-2"))["system"]["serial_no"] == "51110012"
+    assert json.loads(h.get_state_payload("EM-2"))["system"]["hardware"]["model"] == "PM5111"
 
 
 @pytest.mark.parametrize("mode,expected", [("strict", True), ("off", False)])
@@ -174,17 +174,17 @@ def test_removed_proxies_are_detached(logger):
     client = RecordingClient()
     publisher.on_connect(client, None, {}, 0)
     publisher.client = client
-    publisher.sync_proxy_devices(["EM-11"])
-    assert "/r/UK-LON-GLAB/d/EM-12/detach" in client.topics("publish")
-    assert "/r/UK-LON-GLAB/d/EM-12/config" in client.topics("unsubscribe")
+    publisher.sync_proxy_devices(["EM-1"])
+    assert "/r/ZZ-TRI-FECTA/d/EM-2/detach" in client.topics("publish")
+    assert "/r/ZZ-TRI-FECTA/d/EM-2/config" in client.topics("unsubscribe")
 
 
 def test_attach_errors_expire_when_they_stop_recurring(handler_factory, monkeypatch):
     h = handler_factory()
-    h.record_gateway_error("CGW-2", json.dumps({"device_id": "CGW-2", "description": "boom"}))
-    assert "status" in json.loads(h.get_state_payload("CGW-2")).get("gateway", {"status": 1})
-    gw = h.devices_by_id["CGW-2"]
-    gw["attach_error_seen"]["CGW-2"] -= module.ATTACH_ERROR_TTL_SEC + 1
+    h.record_gateway_error("CGW-1", json.dumps({"device_id": "CGW-1", "description": "boom"}))
+    assert "status" in json.loads(h.get_state_payload("CGW-1")).get("gateway", {"status": 1})
+    gw = h.devices_by_id["CGW-1"]
+    gw["attach_error_seen"]["CGW-1"] -= module.ATTACH_ERROR_TTL_SEC + 1
     h._last_health_tick = 0
     h.tick()
     assert gw["attach_status"] is None
@@ -192,22 +192,22 @@ def test_attach_errors_expire_when_they_stop_recurring(handler_factory, monkeypa
 
 def test_attach_errors_for_unattached_proxies_do_not_expire(handler_factory):
     h = handler_factory()
-    h.record_gateway_error("CGW-2", json.dumps({"device_id": "EM-11", "description": "not bound"}))
-    gw = h.devices_by_id["CGW-2"]
-    gw["attach_error_seen"]["EM-11"] -= module.ATTACH_ERROR_TTL_SEC + 1
+    h.record_gateway_error("CGW-1", json.dumps({"device_id": "EM-1", "description": "not bound"}))
+    gw = h.devices_by_id["CGW-1"]
+    gw["attach_error_seen"]["EM-1"] -= module.ATTACH_ERROR_TTL_SEC + 1
     h._last_health_tick = 0
     h.tick()
-    assert gw["attach_status"] is not None and "EM-11" in gw["attach_status"]["message"]
+    assert gw["attach_status"] is not None and "EM-1" in gw["attach_status"]["message"]
 
 
 def test_errors_answering_the_new_session_survive_its_cleanup(handler_factory):
     h = handler_factory()
-    h.record_gateway_error("CGW-2", json.dumps({"device_id": "EM-11", "description": "old"}), generation=1)
+    h.record_gateway_error("CGW-1", json.dumps({"device_id": "EM-1", "description": "old"}), generation=1)
     h.clear_attach_errors(before_generation=2)
-    assert h.devices_by_id["CGW-2"]["attach_status"] is None
-    h.record_gateway_error("CGW-2", json.dumps({"device_id": "EM-11", "description": "new"}), generation=2)
+    assert h.devices_by_id["CGW-1"]["attach_status"] is None
+    h.record_gateway_error("CGW-1", json.dumps({"device_id": "EM-1", "description": "new"}), generation=2)
     h.clear_attach_errors(before_generation=2)
-    assert "new" in h.devices_by_id["CGW-2"]["attach_status"]["message"]
+    assert "new" in h.devices_by_id["CGW-1"]["attach_status"]["message"]
 
 
 class _FakePublisher:
@@ -244,21 +244,21 @@ class _FakePublisher:
 
 def test_rejected_state_publish_is_retried(handler_factory, logger, monkeypatch):
     h = handler_factory()
-    h.handle_config("CGW-2", json.dumps({"version": "1.5.2", "timestamp": "2026-11-04T10:00:00Z"}))
+    h.handle_config("CGW-1", json.dumps({"version": "1.5.2", "timestamp": "2026-11-04T10:00:00Z"}))
     pub = _FakePublisher(reject_topics={"state"})
     base = [1000.0]
     monkeypatch.setattr(gcp_handler.time, "monotonic", lambda: base[0])
     gcp_handler.publish_due_udmi_messages(logger, pub, h)
-    assert ("CGW-2", "state") not in pub.published
+    assert ("CGW-1", "state") not in pub.published
     pub.reject_topics.clear()
     base[0] += 5
     gcp_handler.publish_due_udmi_messages(logger, pub, h)
-    assert ("CGW-2", "state") in pub.published
+    assert ("CGW-1", "state") in pub.published
 
 
 def test_reconnect_clears_old_attach_errors_and_resends_state(handler_factory, logger):
     h = handler_factory()
-    h.record_gateway_error("CGW-2", json.dumps({"device_id": "EM-11", "description": "old"}), generation=0)
+    h.record_gateway_error("CGW-1", json.dumps({"device_id": "EM-1", "description": "old"}), generation=0)
     pub = _FakePublisher()
     stop = threading.Event()
     original_tick = h.tick
@@ -270,5 +270,5 @@ def test_reconnect_clears_old_attach_errors_and_resends_state(handler_factory, l
 
     h.tick = tick_then_reconnect
     gcp_handler.run_gateway_loop(logger, types.SimpleNamespace(modbus__crc_check="strict"), pub, h, queue.Queue(), stop)
-    assert h.devices_by_id["CGW-2"]["attach_status"] is None
-    assert ("CGW-2", "state") in pub.published
+    assert h.devices_by_id["CGW-1"]["attach_status"] is None
+    assert ("CGW-1", "state") in pub.published

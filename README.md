@@ -21,9 +21,10 @@
 The **Moxa GCloud UDMI Integration** (`v4.3.1`) runs on Moxa industrial gateways such as the
 **UC-8220** (Debian 11, Python 3.9). Moxa `MXcloudgate` polls Modbus RTU energy meters (Schneider
 Electric PM5561, PM5111, PM8240) and publishes the raw request/response frames on a local MQTT
-broker. This gateway decodes those frames and acts as a **UDMI 1.5** gateway (e.g. `CGW-2`) for the
-proxied meters (e.g. `EM-11`..`EM-13`), towards **ClearBlade IoT Core** (`/devices/{id}/...` topics,
-JWT authentication) or a **UDMI MQTT broker** (`/r/{registry}/d/{id}/...` topics).
+broker. This gateway decodes those frames and acts as a **UDMI 1.5** gateway (e.g. `CGW-1`) for the
+proxied meters (e.g. `EM-1`..`EM-3`), towards a **Cloud IoT Core compatible MQTT bridge**
+(`/devices/{id}/...` topics, JWT authentication) or a **UDMI MQTT broker**
+(`/r/{registry}/d/{id}/...` topics).
 
 ![image](https://github.com/user-attachments/assets/0a59dbb3-8941-408a-9212-7d70b7078d9e)
 
@@ -35,7 +36,7 @@ The gateway reports what the devices actually say. The UDMI site model is used f
 | :--- | :--- |
 | Meter `serial_no`, `software.firmware`, `hardware.make/model` | Meter identity registers (serial 130 or 117, firmware 1637 or 1717, model 50, manufacturer 70). Until the meter has reported them: the configured `serial_no` (or `unknown`), no firmware, `Schneider Electric` / configured meter `type`. |
 | Gateway `serial_no` | Hardware serial (device tree / DMI) if the platform exposes it, otherwise `site_details.serial_no` or `--serial-no`. |
-| Gateway `hardware` / `software` | `site_details.hardware` / the running gateway version. The platform model is not detected (the device tree may only name the series): without `site_details.hardware` the gateway reports `Moxa` / `UC8220` and logs a warning. |
+| Gateway `hardware` / `software` | `site_details.hardware` / the running gateway version. The platform model is not detected (the device tree may only name the series): without `site_details.hardware` the gateway reports `Moxa` / `unknown` and logs a warning. |
 | Gateway `localnet` (`ether`, `ipv4`, `ipv6`) | Detected on the host. Site model addresses are only used to choose the right NIC on multi-NIC gateways; an address the host does not have is never reported. Re-detected every 60 s. |
 | Meter `localnet.modbus.addr` | The configured serial `port` (e.g. `ttyM0`), if set. |
 | Self-enumeration features / points | The features this code implements and every point in the meter's register map. |
@@ -104,8 +105,7 @@ moxa-gcloud-udmi/
 ├── deploy/moxa-gcloud-udmi.service       # systemd unit (Restart=always, StateDirectory)
 ├── resources/
 │   ├── roots.pem                         # Default CA bundle for the cloud MQTT bridge
-│   ├── config-google-gateway.json        # Gateway runtime configuration
-│   ├── config-cgw2-example.json          # CGW-2 + EM-11..13 configuration example
+│   ├── config-google-gateway.json        # Gateway runtime configuration (example: CGW-1 + EM-1..3)
 │   └── modbus_dbo_maps/                  # Schneider Electric register maps (PM5561, PM5111, PM8240)
 ├── src/
 │   ├── main.py                           # Entry point (exit codes 0 / 1 / 192)
@@ -165,12 +165,14 @@ whether the meter identity registers and all register-map points are polled, "no
 registers and sample values to compare with the meter display. Exit status 0 means ready.
 
 ## Configuration
-`resources/config-google-gateway.json` (see `resources/config-cgw2-example.json`):
+`resources/config-google-gateway.json` is an example for a gateway `CGW-1` with three meters
+`EM-1`..`EM-3`; replace the ids, the placeholders (`your-...`, `REPLACE-WITH-...`) and the gateway
+model with those of your installation:
 
 | Key | Meaning |
 | :--- | :--- |
 | `internal_broker.*` | Local broker where MXcloudgate publishes (`MXcloudgate` topic). |
-| `google_cloud.iot_provider` | `gbos` (ClearBlade / IoT Core topics + JWT) or `mqtt` (UDMI broker). |
+| `google_cloud.iot_provider` | `iot_core` (Cloud IoT Core compatible bridge: `/devices/...` topics + JWT) or `mqtt` (UDMI MQTT broker: `/r/<registry>/d/...` topics). |
 | `google_cloud.project_id`, `mqtt_bridge_hostname`, `mqtt_bridge_port`, `enable_tls`, `ca_cert` | Cloud connection. A configured `ca_cert` must exist; the bundled `resources/roots.pem` falls back to the system trust store if missing. |
 | `google_cloud.sample_rate_set` | Default `events/pointset` interval (s, default 300) until the config sets `sample_rate_sec`/`sample_limit_sec`. |
 | `google_cloud.jwt_expires_minutes` | JWT lifetime (10-1440, default 60). |
@@ -204,11 +206,12 @@ describe the real installation:
   - meters: `system`, `pointset` (stable), `gateway`, `enumeration`, `enumeration.families`,
     `enumeration.features`, `enumeration.pointset` (beta).
 
-The templates in `udmi_site_model/` follow these rules. Their meter identities (serial numbers,
-firmware) are the simulator's (`tools/mxcloudgate_simulator.py`) and, like the gateway serial
-numbers and addresses, are placeholders to replace with the real values. No device keys are
-shipped: generate them per installation (e.g. with the UDMI `bin/keygen` tool); the UDMI registrar
-reports the gateways as incomplete until their keys exist.
+The templates in `udmi_site_model/` (gateway `CGW-1` with meters `EM-1`..`EM-3`) follow these rules.
+Their site name (`ZZ-TRI-FECTA`, the UDMI reference site) and cloud region, the meter identities
+(serial numbers and firmware, which are those of `tools/mxcloudgate_simulator.py`) and the gateway
+serial number, model and addresses are placeholders to replace with the real values. No device
+keys are shipped: generate them per installation (e.g. with the UDMI `bin/keygen` tool); the UDMI
+registrar reports the gateway as incomplete until its key exists.
 
 ## Running as a Service
 ```bash
@@ -233,7 +236,7 @@ main thread turns them into a clean stop.
 
 For a local UDMI broker:
 ```bash
-python3 src/main.py -c resources/config-cgw2-example.json \
+python3 src/main.py -c resources/config-google-gateway.json \
   -iot-provider mqtt -google-cloud-hostname localhost -google-cloud-port 8883 \
   -udmi-site-model-path /path/to/site_model
 ```

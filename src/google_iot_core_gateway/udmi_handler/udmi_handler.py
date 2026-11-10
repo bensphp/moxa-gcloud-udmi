@@ -63,6 +63,8 @@ LOCALNET_REFRESH_SEC = 60.0
 MAX_PENDING_LOGS = 200
 ATTACH_ERROR_TTL_SEC = 600.0  # errors for targets that are not configured proxies expire after 10 minutes
 UNKNOWN_SERIAL = "unknown"
+UNKNOWN_MODEL = "unknown"
+DEFAULT_GATEWAY_MAKE = "Moxa"
 
 MODE_INITIAL = "initial"
 MODE_ACTIVE = "active"
@@ -393,7 +395,7 @@ def _collect_host_metrics() -> dict:
 class UDMIHandler:
     """
     UDMI 1.5 state, config, logging, localnet, gateway and pointset manager for the Moxa gateway
-    device (e.g. CGW-2) and its proxied Modbus devices (e.g. EM-11..13).
+    device (e.g. CGW-1) and its proxied Modbus devices (e.g. EM-1..3).
 
     All public methods are thread-safe.
     """
@@ -580,7 +582,7 @@ class UDMIHandler:
         restart_count: int = 1,
         hardware: dict = None,
     ) -> bool:
-        """Register the gateway device itself (e.g. CGW-2) as a first-class UDMI device."""
+        """Register the gateway device itself (e.g. CGW-1) as a first-class UDMI device."""
         with self._lock:
             metadata = self._load_device_metadata(gateway_id)
             if metadata is None:
@@ -591,14 +593,14 @@ class UDMIHandler:
 
             hw_cfg = hardware if isinstance(hardware, dict) else {}
             record["hardware"] = {
-                "make": str(hw_cfg.get("make") or "Moxa"),
-                "model": str(hw_cfg.get("model") or "UC8220"),
+                "make": str(hw_cfg.get("make") or DEFAULT_GATEWAY_MAKE),
+                "model": str(hw_cfg.get("model") or UNKNOWN_MODEL),
             }
             if not (hw_cfg.get("make") and hw_cfg.get("model")):
                 # The platform model is not detectable reliably (the device tree may only name the
-                # series), so the installer must declare it; say so instead of failing silently.
+                # series), so the installer must declare it; say so instead of guessing a model.
                 self.logger.warning(
-                    f"site_details.hardware does not set both make and model; reporting the default "
+                    f"site_details.hardware does not set both make and model; reporting "
                     f"{record['hardware']} for gateway '{gateway_id}'. Set it to the real gateway model."
                 )
             record["software"] = {"firmware": GATEWAY_SOFTWARE_VERSION}
@@ -652,7 +654,7 @@ class UDMIHandler:
 
     def add_device_to_dict(self, modbus_slave_id, device_id, device_type, serial_no=None, port=None):
         """
-        Register a proxied Modbus slave device (e.g. EM-11 -> slave 1, PM5561).
+        Register a proxied Modbus slave device (e.g. EM-1 -> slave 1, PM5561).
         Maintains both `self.devices[str(modbus_slave_id)]` and `self.devices_by_id[device_id]`.
         """
         with self._lock:

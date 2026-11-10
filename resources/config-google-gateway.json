@@ -8,9 +8,9 @@
     "private_key": null
   },
   "google_cloud": {
-    "iot_provider": "gbos",
-    "cloud_region": "europe-west1",
-    "project_id": "your-clearblade-project-id",
+    "iot_provider": "iot_core",
+    "cloud_region": "your-cloud-region",
+    "project_id": "your-project-id",
     "sample_rate_set": 10,
     "mqtt_bridge_hostname": "your-mqtt-hostname",
     "mqtt_bridge_port": 8883,
@@ -22,24 +22,24 @@
     "crc_check": "strict"
   },
   "site_details": {
-    "gateway_id": "CGW-2",
-    "serial_no": "REPLACE-WITH-UC8220-SERIAL",
+    "gateway_id": "CGW-1",
+    "serial_no": "REPLACE-WITH-GATEWAY-SERIAL",
     "hardware": {
       "make": "Moxa",
-      "model": "UC8220"
+      "model": "UC-8220"
     },
     "proxy_ids": {
-      "EM-11": {
+      "EM-1": {
         "type": "PM5561",
         "modbus_slave_id": 1,
         "port": "ttyM0"
       },
-      "EM-12": {
+      "EM-2": {
         "type": "PM5111",
         "modbus_slave_id": 2,
         "port": "ttyM0"
       },
-      "EM-13": {
+      "EM-3": {
         "type": "PM8240",
         "modbus_slave_id": 3,
         "port": "ttyM0"

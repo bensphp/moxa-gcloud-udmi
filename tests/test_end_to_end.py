@@ -27,7 +27,7 @@ import frame_report
 import mxcloudgate_simulator as sim
 
 pytestmark = pytest.mark.skipif(not os.path.exists(MOSQUITTO), reason="mosquitto not installed")
-PREFIX = "/r/UK-LON-GLAB/d"
+PREFIX = "/r/ZZ-TRI-FECTA/d"
 
 
 def _wait_port(port, proc=None, timeout=10.0) -> bool:
@@ -166,13 +166,13 @@ def test_gateway_loop_end_to_end_and_state_resent_after_reconnect(tmp_path, brok
     port = broker["port"]
     site_dir = write_site_model(tmp_path)
     handler = UDMIHandler(logger, RESOURCES_DIR, str(site_dir), default_sample_rate_sec=1.0, config_wait_timeout_sec=1.0)
-    handler.add_device_to_dict(1, "EM-11", "PM5561", port="ttyM0")
-    handler.register_gateway("CGW-2", proxy_ids=["EM-11"], serial_no="CGW2-E2E")
+    handler.add_device_to_dict(1, "EM-1", "PM5561", port="ttyM0")
+    handler.register_gateway("CGW-1", proxy_ids=["EM-1"], serial_no="GW-E2E")
 
     observer = Observer(port)
     publisher = GoogleIoTCoreMQTTPublisher(
-        logger, {"EM-11": {}}, project_id="local", cloud_region="europe-west1", registry_id="UK-LON-GLAB",
-        gateway_id="CGW-2", private_key_file=None, ca_cert=None, mqtt_bridge_hostname="127.0.0.1",
+        logger, {"EM-1": {}}, project_id="local", cloud_region="europe-west1", registry_id="ZZ-TRI-FECTA",
+        gateway_id="CGW-1", private_key_file=None, ca_cert=None, mqtt_bridge_hostname="127.0.0.1",
         mqtt_bridge_port=port, iot_provider="mqtt", enable_tls=False,
     )
     internal_q = queue.Queue(maxsize=500)
@@ -188,9 +188,9 @@ def test_gateway_loop_end_to_end_and_state_resent_after_reconnect(tmp_path, brok
     loop.start()
     try:
         assert publisher.wait_for_connection(10)
-        observer.wait_for(lambda t, p: t == f"{PREFIX}/EM-11/attach")
-        observer.send_config("CGW-2", _base_config("2026-11-04T11:00:00Z", gateway={"proxy_ids": ["EM-11"]}))
-        observer.send_config("EM-11", _base_config(
+        observer.wait_for(lambda t, p: t == f"{PREFIX}/EM-1/attach")
+        observer.send_config("CGW-1", _base_config("2026-11-04T11:00:00Z", gateway={"proxy_ids": ["EM-1"]}))
+        observer.send_config("EM-1", _base_config(
             "2026-11-04T11:00:00Z", gateway={"target": {"family": "modbus"}},
             pointset={"sample_rate_sec": 1, "points": {"line1_neutral_voltage_sensor": {"ref": "3/3028/2?type=FLOAT32"}}},
         ))
@@ -199,13 +199,13 @@ def test_gateway_loop_end_to_end_and_state_resent_after_reconnect(tmp_path, brok
         while event is None and time.monotonic() < deadline:
             _publish_frames(observer)
             try:
-                event = observer.wait_for(lambda t, p: t == f"{PREFIX}/EM-11/events/pointset", timeout=1.0)
+                event = observer.wait_for(lambda t, p: t == f"{PREFIX}/EM-1/events/pointset", timeout=1.0)
             except AssertionError:
                 pass
         assert event is not None
         assert json.loads(event[1])["points"]["line1_neutral_voltage_sensor"]["present_value"] > 200
-        observer.wait_for(_state_of("CGW-2", lambda s: s["system"]["last_config"] == "2026-11-04T11:00:00Z"))
-        observer.wait_for(_state_of("EM-11", lambda s: s["system"]["serial_no"] == "52110011"))
+        observer.wait_for(_state_of("CGW-1", lambda s: s["system"]["last_config"] == "2026-11-04T11:00:00Z"))
+        observer.wait_for(_state_of("EM-1", lambda s: s["system"]["serial_no"] == "52110011"))
 
         # Broker restart: the gateway reconnects on its own and re-sends state.
         mark = observer.mark()
@@ -218,8 +218,8 @@ def test_gateway_loop_end_to_end_and_state_resent_after_reconnect(tmp_path, brok
             time.sleep(0.1)
         assert publisher.connection_generation > generation
         assert observer.ready.wait(10)
-        observer.wait_for(_state_of("CGW-2"), timeout=15, since=mark)
-        observer.wait_for(_state_of("EM-11"), timeout=15, since=mark)
+        observer.wait_for(_state_of("CGW-1"), timeout=15, since=mark)
+        observer.wait_for(_state_of("EM-1"), timeout=15, since=mark)
     finally:
         stop.set()
         loop.join(timeout=5)
@@ -235,8 +235,8 @@ def _write_gateway_config(tmp_path, port, site_dir, state_dir):
         "internal_broker": {"mqtt_bridge_hostname": "127.0.0.1", "mqtt_bridge_port": port},
         "google_cloud": {"iot_provider": "mqtt", "mqtt_bridge_hostname": "127.0.0.1", "mqtt_bridge_port": port,
                          "enable_tls": False, "sample_rate_set": 5},
-        "site_details": {"gateway_id": "CGW-2", "serial_no": "CGW2-E2E",
-                         "proxy_ids": {"EM-11": {"type": "PM5561", "modbus_slave_id": 1, "port": "ttyM0"}}},
+        "site_details": {"gateway_id": "CGW-1", "serial_no": "GW-E2E",
+                         "proxy_ids": {"EM-1": {"type": "PM5561", "modbus_slave_id": 1, "port": "ttyM0"}}},
         "environment_setup": {"udmi_site_model_path": str(site_dir), "resources_path": RESOURCES_DIR,
                               "state_dir": str(state_dir)},
     }), encoding="utf-8")
@@ -258,11 +258,11 @@ def test_system_mode_restart_really_restarts(tmp_path, broker):
     observer = Observer(port)
     proc = _start_main(config_path)
     try:
-        observer.send_config("CGW-2", _base_config("2026-11-04T12:00:00Z", system={"operation": {"mode": "active"}}))
-        observer.wait_for(_state_of("CGW-2", lambda s: s["system"]["operation"] == {
+        observer.send_config("CGW-1", _base_config("2026-11-04T12:00:00Z", system={"operation": {"mode": "active"}}))
+        observer.wait_for(_state_of("CGW-1", lambda s: s["system"]["operation"] == {
             "operational": True, "last_start": s["system"]["operation"]["last_start"],
             "restart_count": 1, "mode": "active"}), timeout=20)
-        observer.send_config("CGW-2", _base_config("2026-11-04T12:00:05Z", system={"operation": {"mode": "restart"}}))
+        observer.send_config("CGW-1", _base_config("2026-11-04T12:00:05Z", system={"operation": {"mode": "restart"}}))
         assert proc.wait(timeout=20) == EXIT_RESTART
         assert json.loads((state_dir / "persistent_data.json").read_text())["restart_count"] == 1
 
@@ -270,11 +270,11 @@ def test_system_mode_restart_really_restarts(tmp_path, broker):
         mark = observer.mark()
         proc = _start_main(config_path)
         restarted = observer.wait_for(
-            _state_of("CGW-2", lambda s: s["system"]["operation"]["restart_count"] == 2), timeout=20, since=mark)
+            _state_of("CGW-1", lambda s: s["system"]["operation"]["restart_count"] == 2), timeout=20, since=mark)
         assert json.loads(restarted[1])["system"]["operation"]["mode"] == "initial"
         mark = observer.mark()
-        observer.send_config("CGW-2", _base_config("2026-11-04T12:00:10Z", system={"operation": {"mode": "active"}}))
-        observer.wait_for(_state_of("CGW-2", lambda s: s["system"]["operation"]["mode"] == "active"
+        observer.send_config("CGW-1", _base_config("2026-11-04T12:00:10Z", system={"operation": {"mode": "active"}}))
+        observer.wait_for(_state_of("CGW-1", lambda s: s["system"]["operation"]["mode"] == "active"
                                     and s["system"]["operation"]["restart_count"] == 2), timeout=20, since=mark)
         proc.terminate()
         assert proc.wait(timeout=20) == EXIT_OK
@@ -350,8 +350,8 @@ def test_tls_connection_verifies_the_broker(tmp_path, logger, caplog):
 
         def _publisher(ca_file, host="localhost"):
             pub = GoogleIoTCoreMQTTPublisher(
-                logger, {}, project_id="local", cloud_region="europe-west1", registry_id="UK-LON-GLAB",
-                gateway_id="CGW-2", private_key_file=None, ca_cert=str(ca_file), ca_cert_required=True,
+                logger, {}, project_id="local", cloud_region="europe-west1", registry_id="ZZ-TRI-FECTA",
+                gateway_id="CGW-1", private_key_file=None, ca_cert=str(ca_file), ca_cert_required=True,
                 mqtt_bridge_hostname=host, mqtt_bridge_port=port, iot_provider="mqtt", enable_tls=True,
             )
             publishers.append(pub)
@@ -381,7 +381,7 @@ def test_frame_report_listens_to_the_internal_broker(tmp_path, broker):
     config = tmp_path / "config.json"
     config.write_text(json.dumps({
         "internal_broker": {"mqtt_bridge_hostname": "127.0.0.1", "mqtt_bridge_port": port},
-        "site_details": {"proxy_ids": {"EM-11": {"type": "PM5561", "modbus_slave_id": 1}}},
+        "site_details": {"proxy_ids": {"EM-1": {"type": "PM5561", "modbus_slave_id": 1}}},
         "environment_setup": {"resources_path": RESOURCES_DIR},
     }), encoding="utf-8")
     observer = Observer(port)
@@ -402,6 +402,6 @@ def test_frame_report_listens_to_the_internal_broker(tmp_path, broker):
         publisher.join(timeout=5)
         observer.close()
     assert rc == frame_report.EXIT_READY
-    assert len(saved.read_text(encoding="utf-8").splitlines()) >= 8  # every EM-11 block at least once
+    assert len(saved.read_text(encoding="utf-8").splitlines()) >= 8  # every EM-1 block at least once
     assert frame_report.main(["-c", str(config), str(saved)]) == frame_report.EXIT_READY
 

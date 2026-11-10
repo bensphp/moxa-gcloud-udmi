@@ -15,13 +15,13 @@ from google_iot_core_gateway.modbus_gw.modbus_to_json import append_modbus_crc16
 
 def _write_config(tmp_path, proxies=None):
     proxies = proxies or {
-        "EM-11": {"type": "PM5561", "modbus_slave_id": 1},
-        "EM-12": {"type": "PM5111", "modbus_slave_id": 2},
-        "EM-13": {"type": "PM8240", "modbus_slave_id": 3},
+        "EM-1": {"type": "PM5561", "modbus_slave_id": 1},
+        "EM-2": {"type": "PM5111", "modbus_slave_id": 2},
+        "EM-3": {"type": "PM8240", "modbus_slave_id": 3},
     }
     path = tmp_path / "config.json"
     path.write_text(json.dumps({
-        "site_details": {"gateway_id": "CGW-2", "proxy_ids": proxies},
+        "site_details": {"gateway_id": "CGW-1", "proxy_ids": proxies},
         "environment_setup": {"resources_path": RESOURCES_DIR},
     }), encoding="utf-8")
     return str(path)
@@ -58,7 +58,7 @@ def test_complete_valid_traffic_is_ready(tmp_path, capsys):
     out = capsys.readouterr().out
     assert rc == frame_report.EXIT_READY, out
     assert "READY" in out
-    assert "identity serial_no" in out and "52110011" in out  # EM-11's serial, decoded from the frames
+    assert "identity serial_no" in out and "52110011" in out  # EM-1's serial, decoded from the frames
     assert "sample" in out
 
 
@@ -95,21 +95,21 @@ def test_missing_identity_registers_are_reported(tmp_path, capsys):
 
 
 def test_meter_without_frames_and_unknown_unit_ids(tmp_path, capsys):
-    frames = _all_frames(slaves=(1, 2))  # EM-13 (unit 3) silent
+    frames = _all_frames(slaves=(1, 2))  # EM-3 (unit 3) silent
     frames += [(req, resp) for req, resp in sim.build_slave_frames(3, 1)][:1]
-    proxies = {"EM-11": {"type": "PM5561", "modbus_slave_id": 1},
-               "EM-12": {"type": "PM5111", "modbus_slave_id": 2},
-               "EM-14": {"type": "PM8240", "modbus_slave_id": 4}}
+    proxies = {"EM-1": {"type": "PM5561", "modbus_slave_id": 1},
+               "EM-2": {"type": "PM5111", "modbus_slave_id": 2},
+               "EM-4": {"type": "PM8240", "modbus_slave_id": 4}}
     rc = frame_report.main(["-c", _write_config(tmp_path, proxies), _capture(tmp_path, frames)])
     out = capsys.readouterr().out
     assert rc == frame_report.EXIT_PROBLEMS
-    assert "EM-14 (unit 4, PM8240): no frames" in out
+    assert "EM-4 (unit 4, PM8240): no frames" in out
     assert "unit 3: 1 frames but not in site_details.proxy_ids" in out
 
 
 def test_partial_polling_and_rejected_blocks_are_reported(tmp_path, capsys):
     frames = sim.build_slave_frames(1, 1, fail_registers={3028})  # the block with 3028 answers 0x02
-    proxies = {"EM-11": {"type": "PM5561", "modbus_slave_id": 1}}
+    proxies = {"EM-1": {"type": "PM5561", "modbus_slave_id": 1}}
     rc = frame_report.main(["-c", _write_config(tmp_path, proxies), _capture(tmp_path, frames)])
     out = capsys.readouterr().out
     assert rc == frame_report.EXIT_PROBLEMS
@@ -119,7 +119,7 @@ def test_partial_polling_and_rejected_blocks_are_reported(tmp_path, capsys):
 
 def test_not_available_registers_are_reported(tmp_path, capsys):
     frames = sim.build_slave_frames(1, 1, na_registers={3110})
-    proxies = {"EM-11": {"type": "PM5561", "modbus_slave_id": 1}}
+    proxies = {"EM-1": {"type": "PM5561", "modbus_slave_id": 1}}
     rc = frame_report.main(["-c", _write_config(tmp_path, proxies), _capture(tmp_path, frames)])
     out = capsys.readouterr().out
     assert rc == frame_report.EXIT_PROBLEMS
@@ -132,7 +132,7 @@ def test_a_point_split_by_the_polled_blocks_is_not_polled(tmp_path, capsys):
     request = append_modbus_crc16(struct.pack(">BBHH", 1, 3, 3027, 1))  # register 3028 only
     response = append_modbus_crc16(struct.pack(">BBB", 1, 3, 2) + b"\x43\x66")
     frames.append((request, response))
-    proxies = {"EM-11": {"type": "PM5561", "modbus_slave_id": 1}}
+    proxies = {"EM-1": {"type": "PM5561", "modbus_slave_id": 1}}
     rc = frame_report.main(["-c", _write_config(tmp_path, proxies), _capture(tmp_path, frames)])
     out = capsys.readouterr().out
     assert rc == frame_report.EXIT_PROBLEMS

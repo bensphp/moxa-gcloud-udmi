@@ -58,8 +58,9 @@ def get_google_cloud_cmd_line_parser():
         "--iot-provider",
         dest="google_cloud__iot_provider",
         type=str,
-        choices=["gbos", "clearblade", "gcp", "mqtt", "local"],
-        help="IoT MQTT provider mode ('gbos' for ClearBlade/GCP IoT Core, 'mqtt' for local UDMI broker)",
+        choices=["iot_core", "gcp", "mqtt", "local"],
+        help="Upstream MQTT mode: 'iot_core' for a Cloud IoT Core compatible bridge (/devices/... "
+        "topics, JWT), 'mqtt' for a UDMI MQTT broker (/r/<registry>/d/... topics)",
     )
     group.add_argument(
         "-google-cloud-region",
@@ -228,7 +229,7 @@ def _resolve_tls_files(config):
 
 
 def _get_google_iot_core_publisher(logger, config, autostart=False):
-    """Set up the ClearBlade / Cloud IoT Core / local UDMI MQTT publisher client."""
+    """Set up the upstream MQTT publisher client (IoT Core compatible bridge or UDMI MQTT broker)."""
     key_required = config.google_cloud__iot_provider not in ("mqtt", "local")
     private_key_file_path, encryption_algorithm = get_gateway_private_key(
         logger,

@@ -61,7 +61,7 @@ class ConfigHandler:
         self.internal_broker__tls_insecure_set = False
         self.internal_broker__enable_tls = False
 
-        self.google_cloud__iot_provider = "gbos"
+        self.google_cloud__iot_provider = "iot_core"
         self.google_cloud__cloud_region = "europe-west1"
         self.google_cloud__project_id = "moxa01-iot-core"
         self.google_cloud__sample_rate_set = 300  # UDMI config_pointset.json default
@@ -78,8 +78,9 @@ class ConfigHandler:
         self.modbus__stale_timeout_sec = 300.0
         self.modbus__crc_check = "strict"
 
-        self.site_details__name = "KGX-1"
-        self.site_details__registry_id = "KGX-1"
+        # Placeholders (the UDMI reference site name); the site model's cloud_iot_config.json sets them.
+        self.site_details__name = "ZZ-TRI-FECTA"
+        self.site_details__registry_id = "ZZ-TRI-FECTA"
         self.site_details__gateway_id = "CGW-1"
         self.site_details__serial_no = None
         self.site_details__localnet = None

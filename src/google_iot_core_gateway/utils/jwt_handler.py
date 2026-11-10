@@ -4,7 +4,7 @@ import jwt
 from cryptography.hazmat.primitives import serialization
 
 DEFAULT_JWT_EXPIRES_MINUTES = 60
-MAX_JWT_EXPIRES_MINUTES = 24 * 60  # ClearBlade / Cloud IoT Core maximum token lifetime
+MAX_JWT_EXPIRES_MINUTES = 24 * 60  # Cloud IoT Core maximum token lifetime
 
 
 def _load_private_key(private_key_file):

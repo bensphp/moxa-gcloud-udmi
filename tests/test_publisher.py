@@ -13,11 +13,11 @@ from helpers import RecordingClient, make_publisher, write_rsa_key
 
 def test_topic_formats(logger, tmp_path):
     local = make_publisher(logger)
-    assert local._format_device_topic("EM-11", "state") == "/r/UK-LON-GLAB/d/EM-11/state"
-    assert local._parse_device_topic("/r/UK-LON-GLAB/d/EM-11/config") == ("EM-11", "config")
-    cloud = make_publisher(logger, provider="gbos", private_key_file=write_rsa_key(tmp_path))
-    assert cloud._format_device_topic("EM-11", "events/pointset") == "/devices/EM-11/events/pointset"
-    assert cloud._get_client_id() == "projects/proj/locations/europe-west1/registries/UK-LON-GLAB/devices/CGW-2"
+    assert local._format_device_topic("EM-1", "state") == "/r/ZZ-TRI-FECTA/d/EM-1/state"
+    assert local._parse_device_topic("/r/ZZ-TRI-FECTA/d/EM-1/config") == ("EM-1", "config")
+    cloud = make_publisher(logger, provider="iot_core", private_key_file=write_rsa_key(tmp_path))
+    assert cloud._format_device_topic("EM-1", "events/pointset") == "/devices/EM-1/events/pointset"
+    assert cloud._get_client_id() == "projects/proj/locations/europe-west1/registries/ZZ-TRI-FECTA/devices/CGW-1"
 
 
 def test_explicit_ca_must_exist(logger, tmp_path):
@@ -37,14 +37,14 @@ def test_missing_client_certificate_is_fatal(logger, tmp_path):
 
 def test_on_connect_attaches_only_desired_proxies_and_counts_sessions(logger):
     publisher = make_publisher(logger)
-    publisher.sync_proxy_devices(["EM-12", "NOT-CONFIGURED"])  # while disconnected
+    publisher.sync_proxy_devices(["EM-2", "NOT-CONFIGURED"])  # while disconnected
     client = RecordingClient()
     publisher.on_connect(client, None, {}, 0)
     assert publisher.is_connected()
     assert publisher.connection_generation == 1
-    assert client.topics("publish") == ["/r/UK-LON-GLAB/d/EM-12/attach"]
-    assert "/r/UK-LON-GLAB/d/CGW-2/config" in client.topics("subscribe")
-    assert "/r/UK-LON-GLAB/d/CGW-2/errors" in client.topics("subscribe")
+    assert client.topics("publish") == ["/r/ZZ-TRI-FECTA/d/EM-2/attach"]
+    assert "/r/ZZ-TRI-FECTA/d/CGW-1/config" in client.topics("subscribe")
+    assert "/r/ZZ-TRI-FECTA/d/CGW-1/errors" in client.topics("subscribe")
 
     publisher.on_disconnect(client, None, 1)
     assert not publisher.is_connected()
@@ -69,10 +69,10 @@ def test_gateway_error_messages_are_bounded(logger):
             self.qos = 0
 
     for i in range(MAX_GATEWAY_ERRORS * 5):
-        publisher.on_message(None, None, Msg("/r/UK-LON-GLAB/d/CGW-2/errors", f'{{"n": {i}}}'.encode()))
+        publisher.on_message(None, None, Msg("/r/ZZ-TRI-FECTA/d/CGW-1/errors", f'{{"n": {i}}}'.encode()))
     drained = publisher.drain_gateway_errors()
     assert len(drained) == MAX_GATEWAY_ERRORS
-    assert drained[-1] == ("CGW-2", '{"n": %d}' % (MAX_GATEWAY_ERRORS * 5 - 1), 0)
+    assert drained[-1] == ("CGW-1", '{"n": %d}' % (MAX_GATEWAY_ERRORS * 5 - 1), 0)
     assert publisher.drain_gateway_errors() == []
 
 
@@ -80,16 +80,16 @@ def test_config_messages_are_queued(logger):
     publisher = make_publisher(logger)
 
     class Msg:
-        topic = "/r/UK-LON-GLAB/d/EM-11/config"
+        topic = "/r/ZZ-TRI-FECTA/d/EM-1/config"
         payload = b'{"timestamp": "x"}'
         qos = 1
 
     publisher.on_message(None, None, Msg())
-    assert publisher.config_queue.get_nowait() == ("EM-11", '{"timestamp": "x"}')
+    assert publisher.config_queue.get_nowait() == ("EM-1", '{"timestamp": "x"}')
 
 
 def test_jwt_refresh_reconnects_the_same_client(logger, tmp_path):
-    publisher = make_publisher(logger, provider="gbos", private_key_file=write_rsa_key(tmp_path))
+    publisher = make_publisher(logger, provider="iot_core", private_key_file=write_rsa_key(tmp_path))
     original_client = publisher.client
     calls = []
     for name in ("disconnect", "loop_stop", "loop_start"):
