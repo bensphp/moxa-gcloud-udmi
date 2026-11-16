@@ -22,6 +22,7 @@ import logging
 import math
 import os
 import struct
+from typing import Optional
 
 from google_iot_core_gateway import ROOT_DIR
 
@@ -226,14 +227,31 @@ def decode_register_bytes(byte_value: bytes, data_format: str):
     return DECODE_OK, value
 
 
-def modbus_to_json(rtu_request, rtu_response, slave_to_type=None, dbo_maps=None, strict_crc=True):
+def _compiled_registers(meter_map_raw) -> list:
+    """Return [(reg_addr_int, total_bytes, data_format), ...] from a meter register map."""
+    flat_registers = flatten_meter_registers(meter_map_raw)
+    compiled = []
+    for reg_str in flat_registers:
+        try:
+            reg_addr = int(reg_str)
+        except ValueError:
+            continue
+        _total_registers, total_bytes, data_format = _get_dbo_properties(flat_registers, reg_addr)
+        compiled.append((reg_addr, total_bytes, data_format))
+    return compiled
+
+
+def decode_modbus_frame(
+    rtu_request, rtu_response, slave_to_type=None, dbo_maps=None, strict_crc=True
+) -> Optional[dict]:
+    """Decode one Modbus RTU request/response pair into a dict (or None if ignored)."""
     if not rtu_request or len(rtu_request) < 6:
         logger.debug("Ignoring Modbus RTU request shorter than 6 bytes")
         return None
 
     function_code = rtu_request[1]
     if function_code in (0x03, 0x04):
-        return build_fc3_fc4_payload(
+        return _build_fc3_fc4_dict(
             rtu_request,
             rtu_response,
             slave_to_type=slave_to_type,
@@ -244,21 +262,32 @@ def modbus_to_json(rtu_request, rtu_response, slave_to_type=None, dbo_maps=None,
     return None
 
 
-def _error_payload(payload, kind, message, exception_code=None):
+def modbus_to_json(rtu_request, rtu_response, slave_to_type=None, dbo_maps=None, strict_crc=True):
+    payload = decode_modbus_frame(
+        rtu_request,
+        rtu_response,
+        slave_to_type=slave_to_type,
+        dbo_maps=dbo_maps,
+        strict_crc=strict_crc,
+    )
+    return json.dumps(payload) if payload is not None else None
+
+
+def _error_dict(payload, kind, message, exception_code=None) -> dict:
     payload["error"] = message
     payload["error_kind"] = kind
     payload["exception_code"] = exception_code
-    return json.dumps(payload)
+    return payload
 
 
-def build_fc3_fc4_payload(
+def _build_fc3_fc4_dict(
     rtu_request,
     rtu_response,
     slave_to_type=None,
     dbo_maps=None,
     strict_crc=True,
-):
-    """Build and return JSON payload string for Modbus FC03 (Holding) and FC04 (Input) registers."""
+) -> Optional[dict]:
+    """Build and return decoded dict for Modbus FC03 (Holding) and FC04 (Input) registers."""
     slave_id, function_code, starting_address, quantity_of_registers = struct.unpack(
         ">BBHH", rtu_request[:6]
     )
@@ -280,23 +309,23 @@ def build_fc3_fc4_payload(
     if strict_crc:
         # An FC03/FC04 RTU request is 6 bytes plus a 2-byte CRC; accept CRC-less 6-byte requests.
         if len(rtu_request) not in (6, 8):
-            return _error_payload(payload, ERROR_FRAMING, "Invalid Modbus RTU request length")
+            return _error_dict(payload, ERROR_FRAMING, "Invalid Modbus RTU request length")
         if len(rtu_request) == 8 and not verify_modbus_crc16(rtu_request):
-            return _error_payload(payload, ERROR_CRC, "Modbus RTU request CRC-16 mismatch")
+            return _error_dict(payload, ERROR_CRC, "Modbus RTU request CRC-16 mismatch")
 
     if isinstance(rtu_response, Exception):
-        return _error_payload(payload, ERROR_TRANSPORT, str(rtu_response))
+        return _error_dict(payload, ERROR_TRANSPORT, str(rtu_response))
     if rtu_response is None or len(rtu_response) < 5:
-        return _error_payload(payload, ERROR_TRUNCATED, "Empty or truncated Modbus RTU response")
+        return _error_dict(payload, ERROR_TRUNCATED, "Empty or truncated Modbus RTU response")
 
     if strict_crc and not verify_modbus_crc16(rtu_response):
-        return _error_payload(payload, ERROR_CRC, "Modbus RTU response CRC-16 mismatch")
+        return _error_dict(payload, ERROR_CRC, "Modbus RTU response CRC-16 mismatch")
 
     resp_slave_id, resp_function_code, third_byte = struct.unpack(">BBB", rtu_response[:3])
 
     # Modbus exception response (function_code | 0x80)
     if resp_slave_id == slave_id and resp_function_code == (function_code | 0x80):
-        return _error_payload(
+        return _error_dict(
             payload, ERROR_EXCEPTION, describe_modbus_exception(third_byte), third_byte
         )
 
@@ -309,7 +338,7 @@ def build_fc3_fc4_payload(
             len(rtu_response) == 3 + byte_count + 2,
         )
     ):
-        return _error_payload(payload, ERROR_FRAMING, "Invalid Modbus RTU response framing")
+        return _error_dict(payload, ERROR_FRAMING, "Invalid Modbus RTU response framing")
 
     site_devices = {int(k): v for k, v in (slave_to_type or {}).items()}
 
@@ -323,21 +352,15 @@ def build_fc3_fc4_payload(
     else:
         meter_map_raw = _read_ext_config("resources/modbus_dbo_maps", meter_type + ".json")
 
-    if not meter_map_raw:
+    if meter_map_raw is None:
         logger.error(f"Meter map '{meter_type}' could not be loaded")
         return None
 
-    flat_registers = flatten_meter_registers(meter_map_raw)
+    compiled_registers = _compiled_registers(meter_map_raw)
     rtu_response_bytes = rtu_response[3:-2]
 
     data_dict = {}
-    for reg_str in flat_registers:
-        try:
-            reg_addr = int(reg_str)
-        except ValueError:
-            continue
-
-        _total_registers, total_bytes, data_format = _get_dbo_properties(flat_registers, reg_addr)
+    for reg_addr, total_bytes, data_format in compiled_registers:
         start_index, end_index = get_register_offset(reg_addr, starting_address, total_bytes)
 
         # Only decode registers completely contained in the received block
@@ -347,9 +370,27 @@ def build_fc3_fc4_payload(
         byte_value = rtu_response_bytes[start_index:end_index]
         status, decoded = decode_register_bytes(byte_value, data_format)
         if status == DECODE_OK:
-            data_dict[reg_addr] = decoded
+            data_dict[str(reg_addr)] = decoded
         elif status == DECODE_NOT_AVAILABLE:
             payload["unavailable"][str(reg_addr)] = f"N/A({byte_value.hex()})"
 
     payload["data"] = data_dict
-    return json.dumps(payload)
+    return payload
+
+
+def build_fc3_fc4_payload(
+    rtu_request,
+    rtu_response,
+    slave_to_type=None,
+    dbo_maps=None,
+    strict_crc=True,
+):
+    """Build and return JSON payload string for Modbus FC03 (Holding) and FC04 (Input) registers."""
+    payload = _build_fc3_fc4_dict(
+        rtu_request,
+        rtu_response,
+        slave_to_type=slave_to_type,
+        dbo_maps=dbo_maps,
+        strict_crc=strict_crc,
+    )
+    return json.dumps(payload) if payload is not None else None

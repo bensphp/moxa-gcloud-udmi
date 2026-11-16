@@ -68,6 +68,9 @@ def load_gateway_config(path):
 def load_register_maps(resources_dir, meter_types):
     maps = {}
     for meter_type in sorted(set(meter_types)):
+        if str(meter_type).lower() in ("generic", "modbus"):
+            maps[meter_type] = {}
+            continue
         path = Path(resources_dir) / "modbus_dbo_maps" / f"{meter_type}.json"
         try:
             with open(path, "r", encoding="utf-8") as fh:
@@ -182,6 +185,7 @@ def analyse(messages, meters, maps):
             "rejected_blocks": sorted(info["rejected_blocks"]), "blocks": sorted(info["blocks"]),
             "identity": identity, "points_total": len(points), "points_missing": missing,
             "unavailable": sorted(info["unavailable"], key=int), "samples": samples,
+            "generic": not register_map,
         }
     return report
 
@@ -210,6 +214,8 @@ def problems_of(report):
             continue
         if not meter["ok"]:
             found.append(f"{name}: no frame could be decoded ({meter['errors']}).")
+            continue
+        if meter.get("generic"):
             continue
         missing_identity = [f"{field} ({spec['register']})" for field, spec in meter["identity"].items()
                             if not spec["polled"]]
@@ -249,8 +255,11 @@ def render(report, problems):
         for field, spec in meter["identity"].items():
             state = f"= {spec['value']!r}" if spec["polled"] else "NOT POLLED"
             lines.append(f"  identity {field:18s} reg {spec['register']:>5}: {state}")
-        lines.append(f"  points polled: {meter['points_total'] - len(meter['points_missing'])} of "
-                     f"{meter['points_total']}")
+        if meter.get("generic"):
+            lines.append("  generic Modbus device (points configured via UDMI config)")
+        else:
+            lines.append(f"  points polled: {meter['points_total'] - len(meter['points_missing'])} of "
+                         f"{meter['points_total']}")
         if meter["points_missing"]:
             lines.append(f"  not polled: {', '.join(meter['points_missing'])}")
         if meter["unavailable"]:
@@ -285,6 +294,7 @@ def capture_live(seconds, broker, logger):
         broker.get("private_key"),
         bool(broker.get("tls_insecure_set") or False),
         bool(broker.get("enable_tls") or False),
+        topic=broker.get("topic") or "MXcloudgate",
     )
     messages = []
     subscriber.run()

@@ -26,6 +26,8 @@ from google_iot_core_gateway.udmi_handler.udmi_handler import (
     parse_modbus_ref,
 )
 from conftest import META_METER_IDENTITY, RESOURCES_DIR, write_site_model
+from google_iot_core_gateway.gcp_handler import process_payloads
+from google_iot_core_gateway.modbus_gw.modbus_to_json import append_modbus_crc16
 from helpers import config as _config, meter_config as _meter_config, exception_reply as _exception
 from helpers import V, frame as _frame, state_of as _state
 
@@ -310,7 +312,8 @@ class TestPointRefs:
             "ref-1a2b",
             "16/3028?type=BOGUS",
             "6/3028/2",
-            "3/3030/2?type=FLOAT32",
+            "3/3029/2?type=FLOAT32",
+            "3/9999",
             "3/3028/4?type=FLOAT32",
             "3/3028/2?type=INT16",
             "3/3028/2?worder=LWF",
@@ -452,3 +455,104 @@ class TestEnumeration:
         assert alarm["status"]["category"] == CATEGORY_SYSTEM_CONFIG_APPLY
         assert alarm["status"]["level"] == LEVEL_ERROR
         assert "over_voltage" in alarm["status"]["message"]
+
+
+class TestDatapointMapping:
+    @staticmethod
+    def _rtu_msg(slave_id: int, start_reg: int, values_bytes: bytes) -> str:
+        import struct
+
+        qty = len(values_bytes) // 2
+        req = append_modbus_crc16(struct.pack(">BBHH", slave_id, 3, start_reg - 1, qty))
+        resp = append_modbus_crc16(struct.pack(">BBB", slave_id, 3, len(values_bytes)) + values_bytes)
+        return json.dumps({"rtu_request": req.hex(), "rtu_response": resp.hex()})
+
+    def test_point_can_be_renamed_preserving_ref(self, handler_factory):
+        h = handler_factory()
+        h.record_modbus_payload(_frame({3028: 230.5, 3110: 50.0}, start=3028, qty=84))
+        h.handle_config(
+            "EM-1",
+            _meter_config(points={"phase_a_voltage_sensor": {"ref": "3/3028/2?type=FLOAT32", "units": "Volts"}}),
+        )
+        assert _state(h)["pointset"]["points"] == {"phase_a_voltage_sensor": {}}
+        ev = json.loads(h.get_event_point_payload("EM-1"))
+        assert ev["points"] == {"phase_a_voltage_sensor": {"present_value": 230.5}}
+
+    def test_existing_point_can_be_remapped_via_ref(self, handler_factory):
+        h = handler_factory()
+        h.record_modbus_payload(_frame({3028: 230.5, 3030: 232.25}, start=3028, qty=4))
+        h.handle_config(
+            "EM-1",
+            _meter_config(points={"line1_neutral_voltage_sensor": {"ref": "3/3030/2?type=FLOAT32", "units": "Volts"}}),
+        )
+        ev = json.loads(h.get_event_point_payload("EM-1"))
+        assert ev["points"] == {"line1_neutral_voltage_sensor": {"present_value": 232.25}}
+
+    def test_dynamic_unmapped_register_decodes_from_raw_rtu_frame(self, handler_factory, logger):
+        import queue
+        import struct
+
+        h = handler_factory()
+        h.handle_config(
+            "EM-1",
+            _meter_config(points={"extra_power_sensor": {"ref": "3/4500/2?type=FLOAT32", "units": "Kilowatts"}}),
+        )
+        assert _state(h)["pointset"]["points"] == {"extra_power_sensor": {"value_state": "initializing"}}
+        q = queue.Queue()
+        q.put(self._rtu_msg(1, 4500, struct.pack(">f", 12.5)))
+        assert process_payloads(logger, q, h) == 1
+        assert _state(h)["pointset"]["points"] == {"extra_power_sensor": {}}
+        assert json.loads(h.get_event_point_payload("EM-1"))["points"] == {
+            "extra_power_sensor": {"present_value": 12.5}
+        }
+
+    def test_generic_device_without_metadata_works_from_cloud_config_unitid(
+        self, site_dir, logger, monkeypatch
+    ):
+        import queue
+        import struct
+
+        monkeypatch.setattr(module, "detect_hardware_serial", lambda: None)
+        h = module.UDMIHandler(logger, RESOURCES_DIR, str(site_dir), config_wait_timeout_sec=0)
+        assert h.add_device_to_dict(
+            4,
+            "GEN-1",
+            "generic",
+            port="ttyM1",
+            hardware={"make": "Acme", "model": "CustomMeter"},
+        )
+        assert _state(h, "GEN-1")["system"]["hardware"] == {"make": "Acme", "model": "CustomMeter"}
+
+        cfg = _config(
+            "2026-11-16T12:00:00Z",
+            gateway={"target": {"family": "modbus", "addr": "ttyM1", "unitid": "4"}},
+            pointset={
+                "sample_rate_sec": 10,
+                "points": {"custom_temp_sensor": {"ref": "3/100/1?type=INT16", "units": "Celsius"}},
+            },
+        )
+        assert h.handle_config("GEN-1", cfg)
+        q = queue.Queue()
+        q.put(self._rtu_msg(4, 100, struct.pack(">h", 245)))
+        assert process_payloads(logger, q, h) == 1
+        assert _state(h, "GEN-1")["pointset"]["points"] == {"custom_temp_sensor": {}}
+        assert json.loads(h.get_event_point_payload("GEN-1"))["points"] == {
+            "custom_temp_sensor": {"present_value": 245}
+        }
+
+
+def test_clock_step_back_resynchronizes_timestamps(handler_factory, monkeypatch, caplog):
+    h = handler_factory()
+    fake_now = [1_800_000_000.0]
+    monkeypatch.setattr(module.time, "time", lambda: fake_now[0])
+    t1 = h.get_timestamp()
+    # Small jitter (< 5s): stay strictly monotonic.
+    fake_now[0] -= 1.0
+    t2 = h.get_timestamp()
+    assert t2 > t1
+    # Large backwards NTP jump (>= 5s): resynchronize to the real clock.
+    fake_now[0] -= 60.0
+    with caplog.at_level(logging.WARNING):
+        t3 = h.get_timestamp()
+    assert t3 < t1
+    assert "stepped backwards" in caplog.text

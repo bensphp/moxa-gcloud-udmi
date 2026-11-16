@@ -16,7 +16,8 @@ from google_iot_core_gateway.gcp_publisher import GoogleIoTCoreMQTTPublisher
 from google_iot_core_gateway.internal_broker_subscriber.internal_broker_subscriber import (
     MosquittoMQTTSubscriber,
 )
-from google_iot_core_gateway.modbus_gw.modbus_to_json import modbus_to_json
+from google_iot_core_gateway.modbus_gw.modbus_tcp_poller import POLL_MODES, ModbusTCPPoller
+from google_iot_core_gateway.modbus_gw.modbus_to_json import decode_modbus_frame
 from google_iot_core_gateway.runner import run_gateway_process
 from google_iot_core_gateway.udmi_handler.udmi_handler import UDMIHandler
 from google_iot_core_gateway.utils.certificates_handler import (
@@ -26,6 +27,7 @@ from google_iot_core_gateway.utils.certificates_handler import (
 from google_iot_core_gateway.utils.config_handler import ConfigHandler
 from google_iot_core_gateway.utils.log import setup_logger
 from google_iot_core_gateway.utils.persistent_store import PersistentStore
+from google_iot_core_gateway.utils.pointset_buffer import PointsetBuffer
 
 SUMMARY_INTERVAL_SEC = 600.0
 RESTART_FLUSH_TIMEOUT_SEC = 3.0
@@ -136,6 +138,40 @@ def get_google_cloud_cmd_line_parser():
         help="Gateway serial number, used when the hardware does not expose one",
     )
 
+    group = parser.add_argument_group("Modbus poller settings")
+    group.add_argument(
+        "-modbus-poll-mode",
+        "--modbus-poll-mode",
+        dest="modbus__poll_mode",
+        type=str,
+        choices=list(POLL_MODES),
+        help="Optional built-in Modbus TCP poller mode: 'off' (default), 'fallback', or 'active'",
+    )
+    group.add_argument(
+        "-modbus-poll-host",
+        "--modbus-poll-host",
+        dest="modbus__poll_host",
+        type=str,
+        metavar="HOST",
+        help="Modbus TCP server host (e.g. ei-modbus on 127.0.0.1)",
+    )
+    group.add_argument(
+        "-modbus-poll-port",
+        "--modbus-poll-port",
+        dest="modbus__poll_port",
+        type=int,
+        metavar="PORT",
+        help="Modbus TCP server port. Default [502]",
+    )
+    group.add_argument(
+        "-modbus-poll-interval",
+        "--modbus-poll-interval",
+        dest="modbus__poll_interval_sec",
+        type=float,
+        metavar="SECONDS",
+        help="Built-in Modbus TCP polling interval in seconds. Default [10]",
+    )
+
     group = parser.add_argument_group("Environment settings")
     group.add_argument(
         "-udmi-site-model-path",
@@ -218,7 +254,13 @@ def _resolve_tls_files(config):
                     client_cert = cand
                     break
         if not client_key and client_cert:
-            for name in ("rsa_private.pem", "ec_private.pem"):
+            cert_name = os.path.basename(client_cert)
+            key_names = (
+                ("ec_private.pem", "rsa_private.pem")
+                if cert_name.startswith("ec")
+                else ("rsa_private.pem", "ec_private.pem")
+            )
+            for name in key_names:
                 cand = os.path.join(device_dir, name)
                 if os.path.exists(cand):
                     client_key = cand
@@ -281,6 +323,7 @@ def _get_udmi_handler(logger, config, restart_count=1):
             details["type"],
             serial_no=details.get("serial_no"),
             port=details.get("port"),
+            hardware=details.get("hardware"),
         )
         if not device_added:
             logger.error(f"Proxy device '{device_id}' could not be registered and is skipped")
@@ -309,7 +352,10 @@ def process_payloads(logger, google_iot_core_queue, udmi_handler, max_batch=64, 
     Drain up to `max_batch` MXcloudgate Modbus RTU messages from the internal broker queue and
     apply them to the proxied devices.
     """
-    slave_to_type = udmi_handler.get_meter_types()
+    if hasattr(udmi_handler, "get_decoder_maps"):
+        slave_to_type, dbo_maps = udmi_handler.get_decoder_maps()
+    else:
+        slave_to_type, dbo_maps = udmi_handler.get_meter_types(), udmi_handler.dbo_maps
     processed = 0
 
     while processed < max_batch:
@@ -323,16 +369,15 @@ def process_payloads(logger, google_iot_core_queue, udmi_handler, max_batch=64, 
             frame_msg = json.loads(raw_item)
             rtu_request = bytes.fromhex(frame_msg["rtu_request"])
             rtu_response = bytes.fromhex(frame_msg["rtu_response"])
-            decoded_json = modbus_to_json(
+            payload = decode_modbus_frame(
                 rtu_request,
                 rtu_response,
                 slave_to_type=slave_to_type,
-                dbo_maps=udmi_handler.dbo_maps,
+                dbo_maps=dbo_maps,
                 strict_crc=strict_crc,
             )
-            if not decoded_json:
+            if not payload:
                 continue
-            payload = json.loads(decoded_json)
             if payload.get("fc") not in (3, 4):
                 continue
             udmi_handler.record_modbus_payload(payload)
@@ -389,10 +434,13 @@ def _publish(logger, publisher, stats, device_id, payload, topic):
     return info, rc
 
 
-def publish_due_udmi_messages(logger, google_iot_core_publisher, udmi_handler, stats=None):
+def publish_due_udmi_messages(
+    logger, google_iot_core_publisher, udmi_handler, stats=None, pointset_buffer=None
+):
     """
-    Publish due `events/system`, `events/discovery`, changed `state`, and scheduled
-    `events/pointset` messages for the gateway and all active proxied devices.
+    Publish due `events/system`, `events/discovery`, changed `state`, buffered offline
+    `events/pointset` (in FIFO order), and scheduled live `events/pointset` messages for the
+    gateway and all active proxied devices.
 
     `events/system` and `events/discovery` are flushed BEFORE `state` so config logs and
     self-enumeration payloads arrive ahead of the state update. Returns the list of
@@ -400,19 +448,24 @@ def publish_due_udmi_messages(logger, google_iot_core_publisher, udmi_handler, s
     """
     infos = []
     now_mono = time.monotonic()
-    for device_id in udmi_handler.get_active_device_ids():
+    active_ids = udmi_handler.get_active_device_ids()
+    for device_id in active_ids:
         sys_event_payload = udmi_handler.pop_due_system_event_payload(device_id, now_mono=now_mono)
         if sys_event_payload is not None:
-            info, _rc = _publish(
+            info, rc = _publish(
                 logger, google_iot_core_publisher, stats, device_id, sys_event_payload, "events/system"
             )
             infos.append(info)
+            if rc != mqtt.MQTT_ERR_SUCCESS and hasattr(udmi_handler, "system_event_publish_failed"):
+                udmi_handler.system_event_publish_failed(device_id, sys_event_payload)
 
         for disc_payload in udmi_handler.pop_due_discovery_events(device_id):
-            info, _rc = _publish(
+            info, rc = _publish(
                 logger, google_iot_core_publisher, stats, device_id, disc_payload, "events/discovery"
             )
             infos.append(info)
+            if rc != mqtt.MQTT_ERR_SUCCESS and hasattr(udmi_handler, "discovery_event_publish_failed"):
+                udmi_handler.discovery_event_publish_failed(device_id, disc_payload)
 
         state_payload = udmi_handler.pop_due_state_payload(device_id, now_mono=now_mono)
         if state_payload is not None:
@@ -425,13 +478,50 @@ def publish_due_udmi_messages(logger, google_iot_core_publisher, udmi_handler, s
             else:
                 udmi_handler.state_publish_failed(device_id)
 
+    drain_blocked = False
+    if pointset_buffer is not None and len(pointset_buffer) > 0:
+        for _ in range(10):
+            batch = pointset_buffer.pop_batch(1)
+            if not batch:
+                break
+            buf_dev_id, buf_payload = batch[0]
+            info, rc = _publish(
+                logger, google_iot_core_publisher, stats, buf_dev_id, buf_payload, "events/pointset"
+            )
+            infos.append(info)
+            if rc != mqtt.MQTT_ERR_SUCCESS:
+                pointset_buffer.prepend(buf_dev_id, buf_payload)
+                drain_blocked = True
+                break
+
+    for device_id in active_ids:
         pointset_payload = udmi_handler.pop_due_pointset_event_payload(device_id, now_mono=now_mono)
         if pointset_payload is not None:
-            info, _rc = _publish(
+            if drain_blocked and pointset_buffer is not None:
+                pointset_buffer.append(device_id, pointset_payload)
+                continue
+            info, rc = _publish(
                 logger, google_iot_core_publisher, stats, device_id, pointset_payload, "events/pointset"
             )
             infos.append(info)
+            if rc != mqtt.MQTT_ERR_SUCCESS and pointset_buffer is not None:
+                pointset_buffer.append(device_id, pointset_payload)
     return infos
+
+
+def buffer_due_offline_pointsets(udmi_handler, pointset_buffer, now_mono=None) -> int:
+    """Capture due `events/pointset` payloads while the cloud link is down."""
+    if pointset_buffer is None or not pointset_buffer.enabled:
+        return 0
+    now = time.monotonic() if now_mono is None else now_mono
+    buffered = 0
+    for device_id in udmi_handler.get_active_device_ids():
+        pointset_payload = udmi_handler.pop_due_pointset_event_payload(device_id, now_mono=now)
+        if pointset_payload is not None:
+            pointset_buffer.append(device_id, pointset_payload, now_mono=now)
+            buffered += 1
+    pointset_buffer.maybe_persist(force=False, now_mono=now)
+    return buffered
 
 
 def _wait_for_delivery(infos, timeout_sec):
@@ -446,7 +536,15 @@ def _wait_for_delivery(infos, timeout_sec):
             time.sleep(0.05)
 
 
-def run_gateway_loop(logger, config, google_iot_core_publisher, udmi_handler, google_iot_core_queue, stop_event=None):
+def run_gateway_loop(
+    logger,
+    config,
+    google_iot_core_publisher,
+    udmi_handler,
+    google_iot_core_queue,
+    stop_event=None,
+    pointset_buffer=None,
+):
     """Main loop. Returns EXIT_OK on shutdown request or EXIT_RESTART on a UDMI restart request."""
     strict_crc = config.modbus__crc_check == "strict"
     last_generation = google_iot_core_publisher.connection_generation
@@ -477,15 +575,26 @@ def run_gateway_loop(logger, config, google_iot_core_publisher, udmi_handler, go
 
         if google_iot_core_publisher.is_connected():
             infos = publish_due_udmi_messages(
-                logger, google_iot_core_publisher, udmi_handler, stats=stats
+                logger,
+                google_iot_core_publisher,
+                udmi_handler,
+                stats=stats,
+                pointset_buffer=pointset_buffer,
             )
+            if pointset_buffer is not None:
+                pointset_buffer.maybe_persist(force=False)
         else:
             infos = []
+            buffer_due_offline_pointsets(udmi_handler, pointset_buffer)
 
         if udmi_handler.restart_requested:
             if google_iot_core_publisher.is_connected():
                 infos += publish_due_udmi_messages(
-                    logger, google_iot_core_publisher, udmi_handler, stats=stats
+                    logger,
+                    google_iot_core_publisher,
+                    udmi_handler,
+                    stats=stats,
+                    pointset_buffer=pointset_buffer,
                 )
             _wait_for_delivery(infos, RESTART_FLUSH_TIMEOUT_SEC)
             logger.warning("Restart requested via UDMI system.operation.mode; exiting for restart")
@@ -514,23 +623,42 @@ def start_google_iot_core_gateway(logger, args, root_dir=None, stop_event=None):
         google_iot_core_publisher, udmi_handler = prepare_google_cloud_environment(
             logger, config, restart_count=restart_count
         )
+        pointset_buffer = PointsetBuffer(
+            logger, config.state_dir, max_messages=config.google_cloud__offline_buffer_max_messages
+        )
+        google_iot_core_queue = queue.Queue(maxsize=500)
+        int_broker_subscriber = MosquittoMQTTSubscriber(
+            logger,
+            google_iot_core_queue,
+            config.internal_broker__mqtt_bridge_hostname,
+            config.internal_broker__mqtt_bridge_port,
+            config.internal_broker__trusted_root_ca,
+            config.internal_broker__x509_certificate,
+            config.internal_broker__private_key,
+            config.internal_broker__tls_insecure_set,
+            config.internal_broker__enable_tls,
+            topic=config.internal_broker__topic,
+        )
     except GatewayConfigError as exc:
         logger.error(f"Fatal configuration error: {exc}")
         return EXIT_FATAL
 
-    google_iot_core_queue = queue.Queue(maxsize=500)
-    int_broker_subscriber = MosquittoMQTTSubscriber(
-        logger,
-        google_iot_core_queue,
-        config.internal_broker__mqtt_bridge_hostname,
-        config.internal_broker__mqtt_bridge_port,
-        config.internal_broker__trusted_root_ca,
-        config.internal_broker__x509_certificate,
-        config.internal_broker__private_key,
-        config.internal_broker__tls_insecure_set,
-        config.internal_broker__enable_tls,
-    )
+    modbus_poller = None
+    if config.modbus__poll_mode != "off":
+        modbus_poller = ModbusTCPPoller(
+            logger,
+            google_iot_core_queue,
+            udmi_handler,
+            host=config.modbus__poll_host,
+            port=config.modbus__poll_port,
+            mode=config.modbus__poll_mode,
+            interval_sec=config.modbus__poll_interval_sec,
+            timeout_sec=config.modbus__poll_timeout_sec,
+        )
+
     int_broker_subscriber.run()
+    if modbus_poller is not None:
+        modbus_poller.start()
     google_iot_core_publisher.start()
 
     try:
@@ -541,10 +669,14 @@ def start_google_iot_core_gateway(logger, args, root_dir=None, stop_event=None):
             udmi_handler,
             google_iot_core_queue,
             stop_event=stop_event,
+            pointset_buffer=pointset_buffer,
         )
     finally:
+        if modbus_poller is not None:
+            modbus_poller.stop()
         int_broker_subscriber.stop()
         google_iot_core_publisher.close()
+        pointset_buffer.close()
 
 
 def start_standalone_google_iot_core_gateway(assigned_args=None, logger=None, stop_event=None):

@@ -140,6 +140,15 @@ def test_a_point_split_by_the_polled_blocks_is_not_polled(tmp_path, capsys):
     assert "line1_neutral_voltage_sensor" in not_polled
 
 
+def test_generic_device_is_accepted_without_register_map(tmp_path, capsys):
+    frames = sim.build_slave_frames(1, 1)
+    proxies = {"GEN-1": {"type": "generic", "modbus_slave_id": 1}}
+    rc = frame_report.main(["-c", _write_config(tmp_path, proxies), _capture(tmp_path, frames)])
+    out = capsys.readouterr().out
+    assert rc == frame_report.EXIT_READY, out
+    assert "generic Modbus device" in out
+
+
 def test_empty_capture_and_bad_usage(tmp_path, capsys):
     empty = tmp_path / "empty.txt"
     empty.write_text("not a frame\n", encoding="utf-8")

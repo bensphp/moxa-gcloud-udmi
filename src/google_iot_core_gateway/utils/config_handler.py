@@ -6,18 +6,25 @@ import os
 
 from google_iot_core_gateway import ROOT_DIR
 from google_iot_core_gateway.errors import GatewayConfigError
+from google_iot_core_gateway.modbus_gw.modbus_tcp_poller import POLL_MODES
 from google_iot_core_gateway.utils.log import update_logger_verbose_level
+from google_iot_core_gateway.utils.pointset_buffer import DEFAULT_OFFLINE_BUFFER_MAX
 
-SECRET_KEYS = {"mqtt_password", "password", "secret", "token"}
+SECRET_SUBSTRINGS = ("password", "secret", "token", "passphrase")
 SYSTEM_STATE_DIR = "/var/lib/moxa-gcloud-udmi"
 CRC_CHECK_MODES = ("strict", "off")
+
+
+def _is_secret_key(key) -> bool:
+    lowered = str(key).lower()
+    return any(part in lowered for part in SECRET_SUBSTRINGS)
 
 
 def redact_secrets(obj):
     """Return a copy of a parsed config with secret values replaced, for logging."""
     if isinstance(obj, dict):
         return {
-            key: ("***" if key in SECRET_KEYS and value else redact_secrets(value))
+            key: ("***" if _is_secret_key(key) and value else redact_secrets(value))
             for key, value in obj.items()
         }
     if isinstance(obj, list):
@@ -55,6 +62,7 @@ class ConfigHandler:
         # Default configuration will be loaded if not specified in config file
         self.internal_broker__mqtt_bridge_hostname = "127.0.0.1"
         self.internal_broker__mqtt_bridge_port = 1883
+        self.internal_broker__topic = "MXcloudgate"
         self.internal_broker__trusted_root_ca = None
         self.internal_broker__x509_certificate = None
         self.internal_broker__private_key = None
@@ -62,8 +70,8 @@ class ConfigHandler:
         self.internal_broker__enable_tls = False
 
         self.google_cloud__iot_provider = "iot_core"
-        self.google_cloud__cloud_region = "europe-west1"
-        self.google_cloud__project_id = "moxa01-iot-core"
+        self.google_cloud__cloud_region = "us-central1"
+        self.google_cloud__project_id = "your-project-id"
         self.google_cloud__sample_rate_set = 300  # UDMI config_pointset.json default
         self.google_cloud__mqtt_bridge_hostname = "mqtt.googleapis.com"
         self.google_cloud__mqtt_bridge_port = 8883
@@ -74,9 +82,15 @@ class ConfigHandler:
         self.google_cloud__mqtt_username = None
         self.google_cloud__mqtt_password = None
         self.google_cloud__jwt_expires_minutes = 60
+        self.google_cloud__offline_buffer_max_messages = DEFAULT_OFFLINE_BUFFER_MAX
 
         self.modbus__stale_timeout_sec = 300.0
         self.modbus__crc_check = "strict"
+        self.modbus__poll_mode = "off"
+        self.modbus__poll_host = "127.0.0.1"
+        self.modbus__poll_port = 502
+        self.modbus__poll_interval_sec = 10.0
+        self.modbus__poll_timeout_sec = 2.0
 
         # Placeholders (the UDMI reference site name); the site model's cloud_iot_config.json sets them.
         self.site_details__name = "ZZ-TRI-FECTA"
@@ -92,6 +106,8 @@ class ConfigHandler:
                 "modbus_slave_id": 1,
             }
         }
+        self._explicit_cloud_region = False
+        self._explicit_registry_id = False
 
         self.udmi_site_model_path = "/home/moxa/udmi_site_model"
         self.state_dir = None
@@ -141,6 +157,12 @@ class ConfigHandler:
         udmi_site_model_config = os.path.join(
             self.udmi_site_model_path, "cloud_iot_config.json"
         )
+        if not os.path.exists(udmi_site_model_config) and self._explicit_cloud_region and self._explicit_registry_id:
+            self.logger.warning(
+                f"UDMI site model '{udmi_site_model_config}' not found; using explicit "
+                "cloud_region and registry_id"
+            )
+            return
         ext_conf = self._read_ext_config(config_file=udmi_site_model_config)
         if not ext_conf:
             raise GatewayConfigError(f"Empty UDMI site model configuration '{udmi_site_model_config}'")
@@ -163,6 +185,8 @@ class ConfigHandler:
             self.internal_broker__mqtt_bridge_hostname = internal["mqtt_bridge_hostname"]
         if internal.get("mqtt_bridge_port") is not None:
             self.internal_broker__mqtt_bridge_port = int(internal["mqtt_bridge_port"])
+        if internal.get("topic"):
+            self.internal_broker__topic = str(internal["topic"])
         if internal.get("trusted_root_ca"):
             self.internal_broker__trusted_root_ca = internal["trusted_root_ca"]
         if internal.get("x509_certificate"):
@@ -179,6 +203,7 @@ class ConfigHandler:
             self.google_cloud__iot_provider = gcloud["iot_provider"]
         if gcloud.get("cloud_region"):
             self.google_cloud__cloud_region = gcloud["cloud_region"]
+            self._explicit_cloud_region = True
         if gcloud.get("project_id"):
             self.google_cloud__project_id = gcloud["project_id"]
         if gcloud.get("sample_rate_set") is not None:
@@ -201,14 +226,31 @@ class ConfigHandler:
             self.google_cloud__mqtt_password = gcloud["mqtt_password"]
         if gcloud.get("jwt_expires_minutes") is not None:
             self.google_cloud__jwt_expires_minutes = int(gcloud["jwt_expires_minutes"])
+        if gcloud.get("offline_buffer_max_messages") is not None:
+            self.google_cloud__offline_buffer_max_messages = int(gcloud["offline_buffer_max_messages"])
 
         modbus = ext_conf.get("modbus") or {}
         if modbus.get("stale_timeout_sec") is not None:
             self.modbus__stale_timeout_sec = float(modbus["stale_timeout_sec"])
         if modbus.get("crc_check") is not None:
             self.modbus__crc_check = str(modbus["crc_check"]).lower()
+        if modbus.get("poll_mode") is not None:
+            self.modbus__poll_mode = str(modbus["poll_mode"]).lower()
+        if modbus.get("poll_host"):
+            self.modbus__poll_host = str(modbus["poll_host"])
+        if modbus.get("poll_port") is not None:
+            self.modbus__poll_port = int(modbus["poll_port"])
+        if modbus.get("poll_interval_sec") is not None:
+            self.modbus__poll_interval_sec = float(modbus["poll_interval_sec"])
+        if modbus.get("poll_timeout_sec") is not None:
+            self.modbus__poll_timeout_sec = float(modbus["poll_timeout_sec"])
 
         site = ext_conf.get("site_details") or {}
+        if site.get("name"):
+            self.site_details__name = site["name"]
+        if site.get("registry_id"):
+            self.site_details__registry_id = site["registry_id"]
+            self._explicit_registry_id = True
         if site.get("gateway_id"):
             self.site_details__gateway_id = site["gateway_id"]
         if site.get("serial_no"):
@@ -251,6 +293,15 @@ class ConfigHandler:
         if getattr(args, "google_cloud__ca_cert", None) is not None:
             self.google_cloud__ca_cert = args.google_cloud__ca_cert
 
+        if getattr(args, "modbus__poll_mode", None) is not None:
+            self.modbus__poll_mode = str(args.modbus__poll_mode).lower()
+        if getattr(args, "modbus__poll_host", None) is not None:
+            self.modbus__poll_host = args.modbus__poll_host
+        if getattr(args, "modbus__poll_port", None) is not None:
+            self.modbus__poll_port = int(args.modbus__poll_port)
+        if getattr(args, "modbus__poll_interval_sec", None) is not None:
+            self.modbus__poll_interval_sec = float(args.modbus__poll_interval_sec)
+
         if getattr(args, "udmi_site_model_path", None) is not None:
             self.udmi_site_model_path = args.udmi_site_model_path
         if getattr(args, "resources_path", None) is not None:
@@ -266,22 +317,41 @@ class ConfigHandler:
             return
         if getattr(args, "google_cloud__cloud_region", None) is not None:
             self.google_cloud__cloud_region = args.google_cloud__cloud_region
+            self._explicit_cloud_region = True
         if getattr(args, "site_details__name", None) is not None:
             self.site_details__name = args.site_details__name
         if getattr(args, "site_details__registry_id", None) is not None:
             self.site_details__registry_id = args.site_details__registry_id
+            self._explicit_registry_id = True
         if getattr(args, "site_details__gateway_id", None) is not None:
             self.site_details__gateway_id = args.site_details__gateway_id
         if getattr(args, "site_details__serial_no", None) is not None:
             self.site_details__serial_no = str(args.site_details__serial_no)
 
     def _validate(self):
+        for field, port in (
+            ("internal_broker.mqtt_bridge_port", self.internal_broker__mqtt_bridge_port),
+            ("google_cloud.mqtt_bridge_port", self.google_cloud__mqtt_bridge_port),
+            ("modbus.poll_port", self.modbus__poll_port),
+        ):
+            if not 1 <= int(port) <= 65535:
+                raise GatewayConfigError(f"{field} must be between 1 and 65535, got {port}")
         if not 10 <= self.google_cloud__jwt_expires_minutes <= 1440:
             raise GatewayConfigError("google_cloud.jwt_expires_minutes must be between 10 and 1440")
+        if self.google_cloud__offline_buffer_max_messages < 0:
+            raise GatewayConfigError("google_cloud.offline_buffer_max_messages must be >= 0")
         if self.modbus__crc_check not in CRC_CHECK_MODES:
             raise GatewayConfigError(
                 f"modbus.crc_check must be one of {CRC_CHECK_MODES}, got '{self.modbus__crc_check}'"
             )
+        if self.modbus__poll_mode not in POLL_MODES:
+            raise GatewayConfigError(
+                f"modbus.poll_mode must be one of {POLL_MODES}, got '{self.modbus__poll_mode}'"
+            )
+        if self.modbus__poll_interval_sec <= 0:
+            raise GatewayConfigError("modbus.poll_interval_sec must be > 0")
+        if self.modbus__poll_timeout_sec <= 0:
+            raise GatewayConfigError("modbus.poll_timeout_sec must be > 0")
         if self.modbus__stale_timeout_sec <= 0:
             raise GatewayConfigError("modbus.stale_timeout_sec must be > 0")
         if self.google_cloud__sample_rate_set <= 0:
@@ -309,11 +379,12 @@ class ConfigHandler:
 
     def _print_configuration(self):
         self.logger.info(
-            "Configuration: internal broker %s:%s (tls=%s), cloud %s %s:%s (tls=%s, project=%s, "
-            "region=%s), registry %s, gateway %s, proxies %s, site model %s, state dir %s, "
-            "stale timeout %ss, crc %s",
+            "Configuration: internal broker %s:%s (topic=%s, tls=%s), cloud %s %s:%s (tls=%s, "
+            "project=%s, region=%s, buffer=%s), registry %s, gateway %s, proxies %s, site model %s, "
+            "state dir %s, stale timeout %ss, crc %s, poll %s (%s:%s every %ss)",
             self.internal_broker__mqtt_bridge_hostname,
             self.internal_broker__mqtt_bridge_port,
+            self.internal_broker__topic,
             self.internal_broker__enable_tls,
             self.google_cloud__iot_provider,
             self.google_cloud__mqtt_bridge_hostname,
@@ -321,6 +392,7 @@ class ConfigHandler:
             self.google_cloud__enable_tls,
             self.google_cloud__project_id,
             self.google_cloud__cloud_region,
+            self.google_cloud__offline_buffer_max_messages,
             self.site_details__registry_id,
             self.site_details__gateway_id,
             sorted(self.site_details__devices),
@@ -328,4 +400,8 @@ class ConfigHandler:
             self.state_dir,
             self.modbus__stale_timeout_sec,
             self.modbus__crc_check,
+            self.modbus__poll_mode,
+            self.modbus__poll_host,
+            self.modbus__poll_port,
+            self.modbus__poll_interval_sec,
         )

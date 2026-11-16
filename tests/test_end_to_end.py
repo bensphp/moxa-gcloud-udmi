@@ -23,6 +23,7 @@ from google_iot_core_gateway.internal_broker_subscriber.internal_broker_subscrib
     MosquittoMQTTSubscriber,
 )
 from google_iot_core_gateway.udmi_handler.udmi_handler import UDMIHandler
+from google_iot_core_gateway.utils.pointset_buffer import PointsetBuffer
 import frame_report
 import mxcloudgate_simulator as sim
 
@@ -404,4 +405,104 @@ def test_frame_report_listens_to_the_internal_broker(tmp_path, broker):
     assert rc == frame_report.EXIT_READY
     assert len(saved.read_text(encoding="utf-8").splitlines()) >= 8  # every EM-1 block at least once
     assert frame_report.main(["-c", str(config), str(saved)]) == frame_report.EXIT_READY
+
+
+def test_offline_pointset_telemetry_is_buffered_and_flushed_on_reconnect(tmp_path, broker, logger):
+    """Scheduled events/pointset during a broker outage are persisted and flushed in FIFO order."""
+    port = broker["port"]
+    site_dir = write_site_model(tmp_path)
+    state_dir = tmp_path / "state"
+    handler = UDMIHandler(
+        logger, RESOURCES_DIR, str(site_dir), default_sample_rate_sec=1.0, config_wait_timeout_sec=1.0
+    )
+    handler.add_device_to_dict(1, "EM-1", "PM5561", port="ttyM0")
+    handler.register_gateway("CGW-1", proxy_ids=["EM-1"], serial_no="GW-BUF")
+
+    observer = Observer(port)
+    publisher = GoogleIoTCoreMQTTPublisher(
+        logger,
+        {"EM-1": {}},
+        project_id="local",
+        cloud_region="us-central1",
+        registry_id="ZZ-TRI-FECTA",
+        gateway_id="CGW-1",
+        private_key_file=None,
+        ca_cert=None,
+        mqtt_bridge_hostname="127.0.0.1",
+        mqtt_bridge_port=port,
+        iot_provider="mqtt",
+        enable_tls=False,
+    )
+    pointset_buffer = PointsetBuffer(
+        logger, str(state_dir), max_messages=50, persist_interval_sec=0.0
+    )
+    internal_q = queue.Queue(maxsize=500)
+    stop = threading.Event()
+    config = types.SimpleNamespace(modbus__crc_check="strict")
+    loop = threading.Thread(
+        target=lambda: run_gateway_loop(
+            logger, config, publisher, handler, internal_q, stop, pointset_buffer=pointset_buffer
+        ),
+        daemon=True,
+    )
+    loop.start()
+    try:
+        assert publisher.wait_for_connection(10)
+        observer.send_config(
+            "EM-1",
+            _base_config(
+                "2026-11-16T12:00:00Z",
+                gateway={"target": {"family": "modbus"}},
+                pointset={"sample_rate_sec": 1, "points": {"line1_neutral_voltage_sensor": {"ref": "3/3028/2?type=FLOAT32"}}},
+            ),
+        )
+        for req, resp in sim.build_slave_frames(1, 1):
+            internal_q.put(json.dumps({"rtu_request": req.hex(), "rtu_response": resp.hex()}))
+        observer.wait_for(lambda t, p: t == f"{PREFIX}/EM-1/events/pointset", timeout=10)
+
+        # Simulate cloud broker outage while Modbus polling continues.
+        broker["proc"].terminate()
+        broker["proc"].wait(timeout=5)
+        deadline = time.monotonic() + 10
+        while publisher.is_connected() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not publisher.is_connected()
+
+        deadline = time.monotonic() + 10
+        while len(pointset_buffer) < 2 and time.monotonic() < deadline:
+            for req, resp in sim.build_slave_frames(1, 2):
+                internal_q.put(json.dumps({"rtu_request": req.hex(), "rtu_response": resp.hex()}))
+            time.sleep(0.3)
+        assert len(pointset_buffer) >= 2
+        # Verify the buffer was persisted cleanly to disk and can be reloaded.
+        reloaded = PointsetBuffer(logger, str(state_dir), max_messages=50)
+        assert len(reloaded) == len(pointset_buffer)
+        buffered_timestamps = [
+            json.loads(reloaded.pop_batch(1)[0][1])["timestamp"] for _ in range(len(reloaded))
+        ]
+
+        mark = observer.mark()
+        broker["proc"], _port = _start_broker(tmp_path, port)
+        deadline = time.monotonic() + 20
+        while len(pointset_buffer) > 0 and time.monotonic() < deadline:
+            time.sleep(0.1)
+        assert len(pointset_buffer) == 0
+
+        received_timestamps = []
+        for expected_ts in buffered_timestamps:
+            _, payload = observer.wait_for(
+                lambda t, p, ts=expected_ts: (
+                    t == f"{PREFIX}/EM-1/events/pointset" and json.loads(p)["timestamp"] == ts
+                ),
+                timeout=15,
+                since=mark,
+            )
+            received_timestamps.append(json.loads(payload)["timestamp"])
+        assert received_timestamps == sorted(received_timestamps)
+    finally:
+        stop.set()
+        loop.join(timeout=5)
+        pointset_buffer.close()
+        publisher.close()
+        observer.close()
 

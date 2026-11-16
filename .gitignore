@@ -221,4 +221,6 @@ udmi_site_model/**/out/
 *.pkcs8
 *_private.crt
 persistent_data.json
+offline_pointset_buffer.json
 udmi_site_model/out/
+udmi_site_model/registration_summary.json

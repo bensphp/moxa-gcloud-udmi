@@ -18,12 +18,14 @@
 - [License](#license)
 
 ## Overview
-The **Moxa GCloud UDMI Integration** (`v4.3.1`) runs on Moxa industrial gateways such as the
+The **Moxa GCloud UDMI Integration** (`v4.4.0`) runs on Moxa industrial gateways such as the
 **UC-8220** (Debian 11, Python 3.9). Moxa `MXcloudgate` polls Modbus RTU energy meters (Schneider
-Electric PM5561, PM5111, PM8240) and publishes the raw request/response frames on a local MQTT
-broker. This gateway decodes those frames and acts as a **UDMI 1.5** gateway (e.g. `CGW-1`) for the
-proxied meters (e.g. `EM-1`..`EM-3`), towards a **Cloud IoT Core compatible MQTT bridge**
-(`/devices/{id}/...` topics, JWT authentication) or a **UDMI MQTT broker**
+Electric PM5561, PM5111, PM8240, or generic Modbus slaves configured via UDMI `ref`) and publishes
+the raw request/response frames on a local MQTT broker. Optionally, the gateway can also poll a
+Modbus TCP server (such as `ei-modbus` on `127.0.0.1:502`) via `modbus.poll_mode` (`off`,
+`fallback`, or `active`). This gateway decodes those frames and acts as a **UDMI 1.5** gateway (e.g.
+`CGW-1`) for the proxied meters (e.g. `EM-1`..`EM-3`), towards a **Cloud IoT Core compatible MQTT
+bridge** (`/devices/{id}/...` topics, JWT authentication) or a **UDMI MQTT broker**
 (`/r/{registry}/d/{id}/...` topics).
 
 ```mermaid
@@ -83,9 +85,16 @@ Telemetry health:
   atomically (a failing config changes nothing); unknown fields are tolerated; state blocks mirror
   the config blocks. A `pointset` block without a `points` object means "all readable points";
   an empty `points` object means no points.
-- **State publishing**: only on change, at most every 2.1 s (12 s for health-only changes); a state
-  the MQTT client did not accept is re-sent, and state is always re-sent after a (re)connect.
-  Nothing is published while disconnected.
+- **State publishing & offline buffering**: only on change, at most every 2.1 s (12 s for
+  health-only changes); a state, `events/system`, or `events/discovery` payload the MQTT client did
+  not accept is re-queued, and state is always re-sent after a (re)connect. While the cloud link is
+  down, scheduled fresh `events/pointset` messages are buffered up to
+  `google_cloud.offline_buffer_max_messages` (default 500, persisted in `state_dir`) and drained
+  in chronological order on reconnect.
+- **Dynamic datapoint mapping & `generic` Modbus devices**: config `pointset.points.<name>.ref` can
+  rename mapped points, remap them to another register, or define new unmapped registers (when
+  quantity and type are explicit, e.g. `3/4500/2?type=FLOAT32`), and `type: "generic"` works without
+  a static register-map JSON file or local device `metadata.json`.
 - **`system.mode` restart** (gateway only): on `restart` the process exits with status **192** and the
   supervisor starts it again; the new process reports `mode: initial`, a newer `last_start` and a
   `restart_count` that is persisted in `state_dir` (it counts every process start). It switches to
@@ -93,20 +102,24 @@ Telemetry health:
   and are reported as warnings.
 - **Gateway proxying**: attaches the configured proxies, follows `gateway.proxy_ids` changes (ids
   that are not configured locally are reported as `gateway.setup.attach`), validates
-  `gateway.target` (family `modbus`, address = configured `port`/unit id, `unitid`) and surfaces
-  cloud `errors` topic messages (e.g. attach failures) as `gateway.setup.attach` status. An error
+  `gateway.target` (family `modbus`, address = configured `port`/unit id, `unitid`), accepts
+  `unitid` context from either `metadata.json` or cloud `config`, and surfaces cloud `errors`
+  topic messages (e.g. attach failures) as `gateway.setup.attach` status. An error
   for a configured proxy clears when that proxy receives its config, when it is removed from
   `proxy_ids`, or when a new MQTT session starts (errors reported on the new session are kept);
   errors for any other target clear after 10 minutes without recurrence.
 - **Point references** follow the UDMI Modbus grammar:
-  `<function>/<address>[/<quantity>][?type=..&worder=..&border=..]` when the site model gives the unit
-  id (`localnet.families.modbus.unitid`, else `gateway.target.unitid`), otherwise prefixed with
-  `<unitid>/`; the full form `modbus://<addr>/<unitid>/<function>/<address>[/<quantity>]`; or a bare
-  register number. The address is the meter's register number (e.g. `3028`); FC 3/4 only; the type
-  must match the register map; `worder=LWF`, `border=LSB` and `scale`/`offset` are rejected because
-  they cannot be honoured. Unit conversions (`units` different from the register map) are reported
-  as `invalid`. `set_value` (writeback) is not supported and reported as `invalid` (the reading is
-  still published); blob updates and alarms are reported as unsupported (each with a status).
+  `<function>/<address>[/<quantity>][?type=..&worder=..&border=..]` when either the site model or
+  the cloud config supplies the unit id (`localnet.families.modbus.unitid`, else
+  `gateway.target.unitid`), otherwise prefixed with `<unitid>/`; the full form
+  `modbus://<addr>/<unitid>/<function>/<address>[/<quantity>]`; or a bare register number for
+  mapped registers. The address is the meter's 1-based register number (e.g. `3028`); FC 3/4 only;
+  for mapped registers the type must match the register map; unmapped registers require an explicit
+  quantity and numeric type (`INT16`, `UINT16`, `INT32`, `UINT32`, `INT64`, `UINT64`, `FLOAT32`,
+  `FLOAT64`); `worder=LWF`, `border=LSB` and `scale`/`offset` are rejected because they cannot be
+  honoured. Unit conversions (`units` different from the register map) are reported as `invalid`.
+  `set_value` (writeback) is not supported and reported as `invalid` (the reading is still
+  published); blob updates and alarms are reported as unsupported (each with a status).
 - **MQTT**: one paho client (1.x or 2.x) with automatic reconnect (exponential backoff 1-120 s);
   connection failures are logged with the concrete TCP/TLS reason (rate-limited); TLS 1.2+ with
   certificate and hostname verification on every Python version; RS256/ES256 JWTs
@@ -132,9 +145,9 @@ moxa-gcloud-udmi/
 │       ├── gcp_handler.py                # Start-up and main loop
 │       ├── gcp_publisher.py              # Cloud / UDMI MQTT client
 │       ├── internal_broker_subscriber/   # Local MXcloudgate broker subscriber
-│       ├── modbus_gw/                    # Modbus RTU frame decoder
+│       ├── modbus_gw/                    # Modbus RTU frame decoder & optional TCP poller
 │       ├── udmi_handler/                 # UDMI state, config, events and health engine
-│       ├── utils/                        # Config, certificates, JWT, logging, persistent store
+│       ├── utils/                        # Config, certificates, JWT, logging, persistent stores
 │       └── gcp_manager.py                # Legacy Cloud IoT Core provisioning helper (not used by
 │                                         # the gateway; needs the retired google-cloud-iot package)
 ├── tests/                                # pytest suite (unit + live Mosquitto end-to-end)
@@ -188,15 +201,17 @@ model with those of your installation:
 
 | Key | Meaning |
 | :--- | :--- |
-| `internal_broker.*` | Local broker where MXcloudgate publishes (`MXcloudgate` topic). |
+| `internal_broker.*` | Local broker where MXcloudgate publishes (`internal_broker.topic`, default `MXcloudgate`). |
 | `google_cloud.iot_provider` | `iot_core` (Cloud IoT Core compatible bridge: `/devices/...` topics + JWT) or `mqtt` (UDMI MQTT broker: `/r/<registry>/d/...` topics). |
 | `google_cloud.project_id`, `mqtt_bridge_hostname`, `mqtt_bridge_port`, `enable_tls`, `ca_cert` | Cloud connection. A configured `ca_cert` must exist; the bundled `resources/roots.pem` falls back to the system trust store if missing. |
-| `google_cloud.sample_rate_set` | Default `events/pointset` interval (s, default 300) until the config sets `sample_rate_sec`/`sample_limit_sec`. |
+| `google_cloud.sample_rate_set` | Default `events/pointset` interval (s; code default 300, shipped template 60) until the config sets `sample_rate_sec`/`sample_limit_sec`. |
 | `google_cloud.jwt_expires_minutes` | JWT lifetime (10-1440, default 60). |
+| `google_cloud.offline_buffer_max_messages` | Max `events/pointset` events buffered across cloud outages (default 500; `0` disables). |
 | `modbus.stale_timeout_sec` | Freshness limit for readings (default 300). Choose more than 2x the MXcloudgate poll interval. |
 | `modbus.crc_check` | `strict` (default) or `off` if your MXcloudgate version does not forward valid CRCs. |
-| `site_details.gateway_id`, `serial_no`, `hardware`, `localnet.interface` | Gateway identity fallbacks and preferred NIC. |
-| `site_details.proxy_ids.<id>` | `type` (register map), `modbus_slave_id`, optional `port` (e.g. `ttyM0`) and optional fallback `serial_no`. Slave ids must be unique. |
+| `modbus.poll_mode`, `poll_host`, `poll_port`, `poll_interval_sec` | Optional built-in Modbus TCP poller: `off` (default), `fallback` (identity + missing/stale points), or `active` (all configured points). |
+| `site_details.gateway_id`, `serial_no`, `hardware`, `localnet.interface` | Gateway identity fallbacks and preferred NIC. `registry_id` and `name` may also be set here if `cloud_iot_config.json` is omitted. |
+| `site_details.proxy_ids.<id>` | `type` (register map or `generic`), `modbus_slave_id`, optional `port` (e.g. `ttyM0`), optional `hardware`, and optional fallback `serial_no`. Slave ids must be unique. |
 | `environment_setup.udmi_site_model_path`, `resources_path`, `state_dir` | Paths. `state_dir` defaults to systemd's `StateDirectory`, `/var/lib/moxa-gcloud-udmi` or `~/.local/state/moxa-gcloud-udmi`. |
 
 `cloud_region` and `registry_id` from the site model's `cloud_iot_config.json` override the module
@@ -215,7 +230,7 @@ describe the real installation:
   what self-enumeration returns); refs use the grammar above, e.g. `3/3028/2?type=FLOAT32` with
   `localnet.families.modbus` = `{"addr": "<port>", "unitid": "<slave id>"}`.
 - **Gateway**: `localnet.families` must contain only the gateway's real addresses (no `ipv6` unless
-  it has a global IPv6 address); `software` must match the running version (`{"firmware": "4.3.1"}`).
+  it has a global IPv6 address); `software` must match the running version (`{"firmware": "4.4.0"}`).
   The gateway has no points, so it has no `pointset` block.
 - **Features** must equal what the code implements:
   - gateway: `system` (stable), `gateway`, `system.mode`, `enumeration`, `enumeration.families`,

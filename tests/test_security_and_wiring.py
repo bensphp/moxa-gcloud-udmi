@@ -272,3 +272,103 @@ def test_reconnect_clears_old_attach_errors_and_resends_state(handler_factory, l
     gcp_handler.run_gateway_loop(logger, types.SimpleNamespace(modbus__crc_check="strict"), pub, h, queue.Queue(), stop)
     assert h.devices_by_id["CGW-1"]["attach_status"] is None
     assert ("CGW-1", "state") in pub.published
+
+
+def test_rejected_system_and_discovery_events_are_retried(handler_factory, logger):
+    h = handler_factory()
+    h.handle_config(
+        "CGW-1",
+        json.dumps(
+            {
+                "version": "1.5.2",
+                "timestamp": "2026-11-16T10:00:00Z",
+                "discovery": {"generation": "g-retry", "enumerations": {"features": "entries"}},
+            }
+        ),
+    )
+    pub = _FakePublisher(reject_topics={"events/system", "events/discovery"})
+    gcp_handler.publish_due_udmi_messages(logger, pub, h)
+    assert ("CGW-1", "events/system") not in pub.published
+    assert ("CGW-1", "events/discovery") not in pub.published
+
+    pub.reject_topics.clear()
+    gcp_handler.publish_due_udmi_messages(logger, pub, h)
+    assert ("CGW-1", "events/system") in pub.published
+    assert ("CGW-1", "events/discovery") in pub.published
+
+
+def test_config_validation_port_range_and_case_insensitive_redaction(tmp_path, caplog):
+    site = write_site_model(tmp_path)
+    bad_port_cfg = tmp_path / "bad_port.json"
+    bad_port_cfg.write_text(
+        json.dumps(
+            {
+                "google_cloud": {"mqtt_bridge_port": 70000},
+                "site_details": {
+                    "gateway_id": "CGW-1",
+                    "proxy_ids": {"EM-1": {"type": "PM5561", "modbus_slave_id": 1}},
+                },
+                "environment_setup": {"udmi_site_model_path": str(site), "resources_path": RESOURCES_DIR},
+            }
+        )
+    )
+    with pytest.raises(GatewayConfigError, match="mqtt_bridge_port"):
+        ConfigHandler(logging.getLogger("port"), types.SimpleNamespace(config_file=str(bad_port_cfg)))
+
+    redacted = redact_secrets({"Password": "p1", "api_secret_token": "t1", "nested": [{"Passphrase": "p2"}]})
+    assert redacted == {"Password": "***", "api_secret_token": "***", "nested": [{"Passphrase": "***"}]}
+
+
+def test_explicit_registry_and_region_allow_missing_cloud_iot_config(tmp_path, caplog):
+    empty_site = tmp_path / "no_cloud_iot_site"
+    empty_site.mkdir()
+    cfg = tmp_path / "cfg.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "google_cloud": {"iot_provider": "mqtt", "cloud_region": "us-west1"},
+                "site_details": {
+                    "registry_id": "REG-EXPLICIT",
+                    "gateway_id": "CGW-1",
+                    "proxy_ids": {"EM-1": {"type": "generic", "modbus_slave_id": 1}},
+                },
+                "environment_setup": {
+                    "udmi_site_model_path": str(empty_site),
+                    "resources_path": RESOURCES_DIR,
+                    "state_dir": str(tmp_path / "state"),
+                },
+            }
+        )
+    )
+    with caplog.at_level(logging.WARNING):
+        loaded = ConfigHandler(logging.getLogger("explicit"), types.SimpleNamespace(config_file=str(cfg)))
+    assert loaded.site_details__registry_id == "REG-EXPLICIT"
+    assert loaded.google_cloud__cloud_region == "us-west1"
+    assert "cloud_iot_config.json" in caplog.text
+
+
+def test_internal_broker_invalid_host_logs_error_without_nameerror(caplog):
+    from google_iot_core_gateway.internal_broker_subscriber.internal_broker_subscriber import (
+        MosquittoMQTTSubscriber,
+    )
+
+    log = logging.getLogger("int-broker-err")
+    with caplog.at_level(logging.ERROR):
+        sub = MosquittoMQTTSubscriber(log, queue.Queue(), host="")
+    assert sub.client is not None
+    assert "Error preparing internal broker connection" in caplog.text
+
+
+def test_jwt_warns_when_clock_is_unsynchronized(tmp_path, caplog, monkeypatch):
+    from google_iot_core_gateway.utils import jwt_handler
+
+    class _FakeDateTime(datetime.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime.datetime(1970, 1, 1, 0, 1, 0, tzinfo=tz)
+
+    monkeypatch.setattr(jwt_handler.datetime, "datetime", _FakeDateTime)
+    log = logging.getLogger("jwt-clock")
+    with caplog.at_level(logging.WARNING):
+        create_jwt(log, "proj", write_rsa_key(tmp_path), "RS256")
+    assert "unsynchronized" in caplog.text

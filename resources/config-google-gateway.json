@@ -11,15 +11,17 @@
     "iot_provider": "iot_core",
     "cloud_region": "us-central1",
     "project_id": "your-project-id",
-    "sample_rate_set": 10,
+    "sample_rate_set": 60,
     "mqtt_bridge_hostname": "your-mqtt-hostname",
     "mqtt_bridge_port": 8883,
     "enable_tls": true,
-    "jwt_expires_minutes": 60
+    "jwt_expires_minutes": 60,
+    "offline_buffer_max_messages": 500
   },
   "modbus": {
     "stale_timeout_sec": 300,
-    "crc_check": "strict"
+    "crc_check": "strict",
+    "poll_mode": "off"
   },
   "site_details": {
     "gateway_id": "CGW-1",

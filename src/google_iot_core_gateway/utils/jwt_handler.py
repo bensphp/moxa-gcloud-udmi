@@ -1,3 +1,7 @@
+# This software is licensed under GNU GENERAL PUBLIC LICENSE Version 3, 29 June 2007
+
+"""JWT creation for Cloud IoT Core compatible MQTT bridge authentication."""
+
 import datetime
 
 import jwt
@@ -5,6 +9,7 @@ from cryptography.hazmat.primitives import serialization
 
 DEFAULT_JWT_EXPIRES_MINUTES = 60
 MAX_JWT_EXPIRES_MINUTES = 24 * 60  # Cloud IoT Core maximum token lifetime
+MIN_VALID_CLOCK_YEAR = 2024
 
 
 def _load_private_key(private_key_file):
@@ -35,6 +40,12 @@ def create_jwt(logger, project_id, private_key_file, algorithm, expires_minutes=
 
     # The time that the token was issued at
     jwt_iat = datetime.datetime.now(datetime.timezone.utc)
+    if jwt_iat.year < MIN_VALID_CLOCK_YEAR:
+        logger.warning(
+            "System clock (%s) appears unsynchronized; JWT authentication requires accurate "
+            "UTC time (check NTP/chrony)",
+            jwt_iat.isoformat(),
+        )
     # The time the token expires.
     jwt_exp = jwt_iat + datetime.timedelta(minutes=expires_minutes)
 

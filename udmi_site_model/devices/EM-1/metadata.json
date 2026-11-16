@@ -41,7 +41,7 @@
     }
   },
   "pointset": {
-    "sample_rate_sec": 300,
+    "sample_rate_sec": 60,
     "points": {
       "line1_current_sensor": {
         "units": "Amperes",

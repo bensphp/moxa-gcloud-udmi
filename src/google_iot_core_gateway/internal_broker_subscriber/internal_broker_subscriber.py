@@ -1,9 +1,16 @@
+# This software is licensed under GNU GENERAL PUBLIC LICENSE Version 3, 29 June 2007
+
+"""Subscriber for raw Modbus RTU frames published on the local MXcloudgate MQTT broker."""
+
 import logging
+import os
 import queue
 import threading
 import time
 
 import paho.mqtt.client as mqtt
+
+from google_iot_core_gateway.errors import GatewayConfigError
 
 
 def _create_paho_client(client_id="", protocol=mqtt.MQTTv311):
@@ -15,6 +22,14 @@ def _create_paho_client(client_id="", protocol=mqtt.MQTTv311):
             protocol=protocol,
         )
     return mqtt.Client(client_id=client_id, protocol=protocol)
+
+
+def _rc_value(rc) -> int:
+    """Normalize paho return/reason codes (int in 1.x, ReasonCode objects in 2.x)."""
+    try:
+        return int(getattr(rc, "value", rc))
+    except (TypeError, ValueError):
+        return -1
 
 
 class MosquittoMQTTSubscriber:
@@ -42,7 +57,7 @@ class MosquittoMQTTSubscriber:
         self._private_key = keyfile
         self._tls_insecure_set = disable_tls_cert_verification
         self._enable_tls = enable_tls
-        self._topic = topic
+        self._topic = topic or "MXcloudgate"
         self._dropped = 0
         self._last_drop_log = 0.0
 
@@ -58,6 +73,13 @@ class MosquittoMQTTSubscriber:
             self.client.on_log = self._on_log
 
         if self._enable_tls:
+            for label, path in (
+                ("internal broker CA certificate", self._trusted_root_ca),
+                ("internal broker client certificate", self._x509_certificate),
+                ("internal broker client key", self._private_key),
+            ):
+                if path and not os.path.exists(path):
+                    raise GatewayConfigError(f"Configured {label} file '{path}' not found")
             # paho picks PROTOCOL_TLS_CLIENT (TLS 1.2+, certificate verification on).
             self.client.tls_set(
                 ca_certs=self._trusted_root_ca,
@@ -69,15 +91,17 @@ class MosquittoMQTTSubscriber:
         try:
             self.client.connect_async(self._broker_url, self._port, 60)
         except Exception as e:
-            logger.error("Error preparing internal broker connection: {}".format(e))
+            self.logger.error("Error preparing internal broker connection: {}".format(e))
 
     def _error_str(self, rc):
         """Convert a Paho error to a human readable string."""
-        return "{}: {}".format(rc, mqtt.error_string(rc))
+        rc_val = _rc_value(rc)
+        return "{}: {}".format(rc, mqtt.error_string(rc_val))
 
     def _on_connect(self, client, user_data, flags, rc, *args):
-        self.logger.debug(f"on_connect: {mqtt.connack_string(rc)}")
-        if rc == 0:
+        rc_val = _rc_value(rc)
+        self.logger.debug(f"on_connect: {mqtt.connack_string(rc_val)}")
+        if rc_val == 0:
             self.logger.info(
                 "Connected successfully to MXcloudgate internal broker: {}:{}".format(
                     self._broker_url, self._port
@@ -86,7 +110,7 @@ class MosquittoMQTTSubscriber:
             self.logger.info(f"Subscribing to internal broker topic '{self._topic}'")
             client.subscribe(self._topic, 0)
         else:
-            self.logger.error(f"Internal broker connection failed with rc={rc}")
+            self.logger.error(f"Internal broker connection failed with rc={rc_val}")
 
     def _on_disconnect(self, client, user_data, *args):
         rc = args[-1] if args else 0

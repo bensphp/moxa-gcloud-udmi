@@ -289,6 +289,7 @@ class GoogleIoTCoreMQTTPublisher:
             return  # the next automatic reconnect attempt uses the new token
         self.logger.info("Refreshing JWT: reconnecting the MQTT session with a new token")
         with self._lock:
+            self._connected.clear()
             self.client.disconnect()
             self.client.loop_stop()
             self.client.connect_async(
