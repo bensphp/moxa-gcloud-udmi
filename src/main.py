@@ -36,6 +36,21 @@ def get_internal_broker_cmd_line_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(add_help=False)
 
     group = parser.add_argument_group("Internal Broker settings")
+    broker_toggle = group.add_mutually_exclusive_group()
+    broker_toggle.add_argument(
+        "--internal-broker-enabled",
+        dest="internal_broker__enabled",
+        action="store_true",
+        default=None,
+        help="Enable the internal MXcloudgate MQTT broker subscriber",
+    )
+    broker_toggle.add_argument(
+        "--no-internal-broker",
+        dest="internal_broker__enabled",
+        action="store_false",
+        default=argparse.SUPPRESS,
+        help="Disable the internal MXcloudgate MQTT broker subscriber",
+    )
     group.add_argument(
         "-internal-broker-hostname",
         dest="internal_broker__mqtt_bridge_hostname",

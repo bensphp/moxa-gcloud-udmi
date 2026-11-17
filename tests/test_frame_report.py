@@ -158,3 +158,273 @@ def test_empty_capture_and_bad_usage(tmp_path, capsys):
     with pytest.raises(SystemExit) as exc:
         frame_report.main(["-c", _write_config(tmp_path)])  # neither a capture nor --live
     assert exc.value.code == 2
+
+
+def _build_register_lookup(slave_id, extra_fc_regs=None):
+    """Build {(fc, reg_1based): 2_byte_word} from simulator frames plus optional extras."""
+    reg_words = {}
+    for req, resp in sim.build_slave_frames(slave_id, 1):
+        req_fc = req[1]
+        start_reg = int.from_bytes(req[2:4], "big") + 1
+        qty = int.from_bytes(req[4:6], "big")
+        data_bytes = resp[3:-2]
+        for idx in range(qty):
+            reg_words[(req_fc, start_reg + idx)] = data_bytes[idx * 2 : idx * 2 + 2]
+    if extra_fc_regs:
+        for (req_fc, reg_addr), raw_bytes in extra_fc_regs.items():
+            for idx in range(0, len(raw_bytes), 2):
+                reg_words[(req_fc, reg_addr + (idx // 2))] = raw_bytes[idx : idx + 2]
+    return reg_words
+
+
+def _answer_modbus_pdu(reg_words, unit_id, pdu_bytes):
+    req_fc = pdu_bytes[0]
+    start_reg = int.from_bytes(pdu_bytes[1:3], "big") + 1
+    qty = int.from_bytes(pdu_bytes[3:5], "big")
+    if req_fc not in (3, 4):
+        return bytes([unit_id, req_fc | 0x80, 0x01])
+    payload = bytearray([unit_id, req_fc, qty * 2])
+    for offset in range(qty):
+        payload.extend(reg_words.get((req_fc, start_reg + offset), b"\x00\x00"))
+    return bytes(payload)
+
+
+class _ModbusTCPTestServer:
+    """Minimal multi-FC Modbus TCP server for frame_report and E2E tests."""
+
+    def __init__(self, registers_by_slave):
+        import socket
+        import threading
+
+        self._registers_by_slave = registers_by_slave
+        self._stop = threading.Event()
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.bind(("127.0.0.1", 0))
+        self._sock.listen(4)
+        self._sock.settimeout(0.1)
+        self.port = self._sock.getsockname()[1]
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self._thread.start()
+
+    def _serve(self):
+        import socket
+
+        while not self._stop.is_set():
+            try:
+                conn, _addr = self._sock.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            conn.settimeout(0.2)
+            try:
+                while not self._stop.is_set():
+                    try:
+                        mbap = conn.recv(7)
+                    except socket.timeout:
+                        continue
+                    if not mbap or len(mbap) < 7:
+                        break
+                    tx_id, proto_id, length, unit_id = struct.unpack(">HHHB", mbap)
+                    pdu = conn.recv(length - 1)
+                    if len(pdu) < 5:
+                        break
+                    reg_words = self._registers_by_slave.get(unit_id, {})
+                    body = _answer_modbus_pdu(reg_words, unit_id, pdu)
+                    resp_mbap = struct.pack(">HHH", tx_id, proto_id, len(body))
+                    conn.sendall(resp_mbap + body)
+            except OSError:
+                pass
+            finally:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+
+    def close(self):
+        self._stop.set()
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+        self._thread.join(timeout=5)
+
+
+class _PtyRtuResponder:
+    """Modbus RTU slave responder attached to the master side of a pty pair."""
+
+    def __init__(self, master_fd, registers_by_slave):
+        import os
+        import select
+        import threading
+
+        self._master_fd = master_fd
+        self._registers_by_slave = registers_by_slave
+        self._os = os
+        self._select = select
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self._thread.start()
+
+    def _serve(self):
+        from google_iot_core_gateway.modbus_gw.modbus_to_json import verify_modbus_crc16
+
+        buf = bytearray()
+        while not self._stop.is_set():
+            try:
+                readable, _wr, _ex = self._select.select([self._master_fd], [], [], 0.05)
+            except (OSError, ValueError):
+                break
+            if not readable:
+                continue
+            try:
+                chunk = self._os.read(self._master_fd, 256)
+            except OSError:
+                break
+            if not chunk:
+                break
+            buf.extend(chunk)
+            while len(buf) >= 8:
+                frame = bytes(buf[:8])
+                del buf[:8]
+                if not verify_modbus_crc16(frame):
+                    continue
+                unit_id = frame[0]
+                reg_words = self._registers_by_slave.get(unit_id, {})
+                body = _answer_modbus_pdu(reg_words, unit_id, frame[1:6])
+                self._os.write(self._master_fd, append_modbus_crc16(body))
+
+    def close(self):
+        self._stop.set()
+        self._thread.join(timeout=5)
+
+
+def test_mutually_exclusive_and_save_usage_errors(tmp_path):
+    cfg = _write_config(tmp_path)
+    for bad_argv in (
+        ["-c", cfg, "--live", "1", "--poll-tcp", "1"],
+        ["-c", cfg, "--save", str(tmp_path / "out.jsonl"), str(tmp_path / "in.jsonl")],
+        ["-c", cfg, "--poll-tcp", "0"],
+        ["-c", cfg, "--poll-serial", "-1"],
+    ):
+        with pytest.raises(SystemExit) as exc:
+            frame_report.main(bad_argv)
+        assert exc.value.code == 2
+
+
+def test_poll_tcp_handles_fc03_and_fc04_and_saves_capture(tmp_path, capsys):
+    from conftest import write_site_model
+
+    site_dir = write_site_model(
+        tmp_path,
+        meter_points={
+            "line1_neutral_voltage_sensor": {"units": "Volts", "ref": "3/3028/2?type=FLOAT32"},
+            "frequency_sensor": {"units": "Hertz", "ref": "3/3110/2?type=FLOAT32"},
+            "input_register_voltage": {"units": "Volts", "ref": "4/4000/2?type=FLOAT32"},
+        },
+    )
+    reg_words = _build_register_lookup(1, extra_fc_regs={(4, 4000): struct.pack(">f", 234.5)})
+    server = _ModbusTCPTestServer({1: reg_words})
+    cfg_path = tmp_path / "tcp-cfg.json"
+    cfg_path.write_text(
+        json.dumps(
+            {
+                "internal_broker": {"enabled": False},
+                "modbus": {
+                    "transport": "tcp",
+                    "poll_host": "127.0.0.1",
+                    "poll_port": server.port,
+                    "poll_interval_sec": 0.2,
+                    "poll_timeout_sec": 1.0,
+                },
+                "site_details": {
+                    "gateway_id": "CGW-1",
+                    "proxy_ids": {"EM-1": {"type": "PM5561", "modbus_slave_id": 1}},
+                },
+                "environment_setup": {
+                    "resources_path": RESOURCES_DIR,
+                    "udmi_site_model_path": str(site_dir),
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    saved_path = tmp_path / "tcp-capture.jsonl"
+    try:
+        rc = frame_report.main(["-c", str(cfg_path), "--poll-tcp", "0.35", "--save", str(saved_path)])
+    finally:
+        server.close()
+
+    out = capsys.readouterr().out
+    assert rc == frame_report.EXIT_READY, out
+    assert "READY" in out
+    assert "52110001" in out
+    saved_lines = [json.loads(line) for line in saved_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert saved_lines
+    fcs_seen = {bytes.fromhex(item["rtu_request"])[1] for item in saved_lines}
+    assert fcs_seen == {3, 4}
+    assert frame_report.main(["-c", str(cfg_path), str(saved_path)]) == frame_report.EXIT_READY
+
+
+def test_poll_serial_over_pty_saves_capture(tmp_path, capsys):
+    import os
+    import pty
+
+    from conftest import write_site_model
+
+    site_dir = write_site_model(
+        tmp_path,
+        meter_points={
+            "line1_neutral_voltage_sensor": {"units": "Volts", "ref": "3/3028/2?type=FLOAT32"},
+            "input_register_current": {"units": "Amperes", "ref": "4/4010/2?type=FLOAT32"},
+        },
+    )
+    master_fd, slave_fd = pty.openpty()
+    slave_path = os.ttyname(slave_fd)
+    reg_words = _build_register_lookup(1, extra_fc_regs={(4, 4010): struct.pack(">f", 12.25)})
+    responder = _PtyRtuResponder(master_fd, {1: reg_words})
+    cfg_path = tmp_path / "rtu-cfg.json"
+    cfg_path.write_text(
+        json.dumps(
+            {
+                "internal_broker": {"enabled": False},
+                "modbus": {
+                    "transport": "rtu",
+                    "serial_ports": {"ttyM0": slave_path},
+                    "baudrate": 19200,
+                    "parity": "E",
+                    "stopbits": 1,
+                    "poll_interval_sec": 0.2,
+                    "poll_timeout_sec": 1.0,
+                },
+                "site_details": {
+                    "gateway_id": "CGW-1",
+                    "proxy_ids": {"EM-1": {"type": "PM5561", "modbus_slave_id": 1, "port": "ttyM0"}},
+                },
+                "environment_setup": {
+                    "resources_path": RESOURCES_DIR,
+                    "udmi_site_model_path": str(site_dir),
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    saved_path = tmp_path / "rtu-capture.jsonl"
+    try:
+        rc = frame_report.main(["-c", str(cfg_path), "--poll-serial", "0.35", "--save", str(saved_path)])
+    finally:
+        responder.close()
+        os.close(slave_fd)
+        os.close(master_fd)
+
+    out = capsys.readouterr().out
+    assert rc == frame_report.EXIT_READY, out
+    assert "READY" in out
+    assert "52110001" in out
+    saved_lines = [json.loads(line) for line in saved_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert saved_lines
+    fcs_seen = {bytes.fromhex(item["rtu_request"])[1] for item in saved_lines}
+    assert fcs_seen == {3, 4}
+    assert frame_report.main(["-c", str(cfg_path), str(saved_path)]) == frame_report.EXIT_READY
+

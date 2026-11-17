@@ -372,3 +372,378 @@ def test_jwt_warns_when_clock_is_unsynchronized(tmp_path, caplog, monkeypatch):
     with caplog.at_level(logging.WARNING):
         create_jwt(log, "proj", write_rsa_key(tmp_path), "RS256")
     assert "unsynchronized" in caplog.text
+
+
+def _write_cfg_file(tmp_path, site_dir, extra_sections=None, filename="v450-cfg.json"):
+    payload = {
+        "google_cloud": {"iot_provider": "mqtt", "enable_tls": False},
+        "site_details": {
+            "gateway_id": "CGW-1",
+            "serial_no": "GW-TEST",
+            "proxy_ids": {"EM-1": {"type": "PM5561", "modbus_slave_id": 1, "port": "ttyM0"}},
+        },
+        "environment_setup": {
+            "udmi_site_model_path": str(site_dir),
+            "resources_path": RESOURCES_DIR,
+            "state_dir": str(tmp_path / "state"),
+        },
+    }
+    if extra_sections:
+        payload.update(extra_sections)
+    cfg_path = tmp_path / filename
+    cfg_path.write_text(json.dumps(payload), encoding="utf-8")
+    return cfg_path
+
+
+class _SpyPublisher:
+    def __init__(self, *args, **kwargs):
+        self.init_args = args
+        self.init_kwargs = kwargs
+        self.started = False
+        self.closed = False
+        self.connection_generation = 0
+        self.config_queue = queue.Queue()
+
+    def start(self):
+        self.started = True
+
+    def close(self):
+        self.closed = True
+
+
+class _SpySubscriber:
+    instances = []
+
+    def __init__(self, *args, **kwargs):
+        self.args = args
+        self.kwargs = kwargs
+        self.ran = False
+        self.stopped = False
+        _SpySubscriber.instances.append(self)
+
+    def run(self):
+        self.ran = True
+
+    def stop(self):
+        self.stopped = True
+
+
+class _SpyTCPPoller:
+    instances = []
+
+    def __init__(self, *args, **kwargs):
+        self.args = args
+        self.kwargs = kwargs
+        self.started = False
+        self.stopped = False
+        _SpyTCPPoller.instances.append(self)
+
+    def start(self):
+        self.started = True
+
+    def stop(self):
+        self.stopped = True
+
+
+class _SpyRTUPoller:
+    instances = []
+
+    def __init__(self, *args, **kwargs):
+        self.args = args
+        self.kwargs = kwargs
+        self.started = False
+        self.stopped = False
+        _SpyRTUPoller.instances.append(self)
+
+    def start(self):
+        self.started = True
+
+    def stop(self):
+        self.stopped = True
+
+
+def _fake_loop_capture(captured):
+    def _runner(_logger, config, _pub, udmi_handler, _q, **_kw):
+        captured["config"] = config
+        captured["udmi_handler"] = udmi_handler
+        return 0
+
+    return _runner
+
+
+def test_internal_broker_enabled_validation_and_off_warning(tmp_path, caplog):
+    site_dir = write_site_model(tmp_path)
+    default_cfg = _write_cfg_file(tmp_path, site_dir, filename="default.json")
+    loaded = ConfigHandler(logging.getLogger("ib-default"), types.SimpleNamespace(config_file=str(default_cfg)))
+    assert loaded.internal_broker__enabled is True
+    assert loaded.modbus__transport == "tcp"
+    assert loaded.site_details__gateway_points_enabled is False
+
+    for bad_val in ("false", 0, 1, None):
+        bad_cfg = _write_cfg_file(
+            tmp_path,
+            site_dir,
+            {"internal_broker": {"enabled": bad_val}},
+            filename=f"bad-enabled-{type(bad_val).__name__}.json",
+        )
+        with pytest.raises(GatewayConfigError, match="internal_broker.enabled"):
+            ConfigHandler(logging.getLogger("ib-bad"), types.SimpleNamespace(config_file=str(bad_cfg)))
+
+    off_cfg = _write_cfg_file(
+        tmp_path,
+        site_dir,
+        {
+            "internal_broker": {"enabled": False, "mqtt_bridge_port": 0},
+            "modbus": {"poll_mode": "off"},
+        },
+        filename="ib-disabled.json",
+    )
+    warn_logger = logging.getLogger("ib-warn")
+    with caplog.at_level(logging.WARNING, logger="ib-warn"):
+        disabled = ConfigHandler(warn_logger, types.SimpleNamespace(config_file=str(off_cfg)))
+    assert disabled.internal_broker__enabled is False
+    assert "no Modbus telemetry source is enabled" in caplog.text
+
+
+def test_modbus_transport_serial_and_numeric_type_validation(tmp_path):
+    site_dir = write_site_model(tmp_path)
+    valid_cfg = _write_cfg_file(
+        tmp_path,
+        site_dir,
+        {
+            "internal_broker": {"enabled": False},
+            "modbus": {
+                "poll_mode": "active",
+                "transport": "rtu",
+                "serial_port": "/dev/ttyM0",
+                "serial_ports": {"ttyM0": "/dev/ttyM0"},
+                "baudrate": 19200,
+                "bytesize": 8,
+                "parity": "e",
+                "stopbits": 2,
+                "rs485_mode": True,
+            },
+            "site_details": {
+                "gateway_id": "CGW-1",
+                "gateway_points_enabled": True,
+                "proxy_ids": {"EM-1": {"type": "PM5561", "modbus_slave_id": 1}},
+            },
+        },
+        filename="valid-rtu.json",
+    )
+    loaded = ConfigHandler(logging.getLogger("rtu-ok"), types.SimpleNamespace(config_file=str(valid_cfg)))
+    assert loaded.modbus__transport == "rtu"
+    assert loaded.modbus__parity == "E"
+    assert loaded.modbus__baudrate == 19200
+    assert loaded.modbus__stopbits == 2
+    assert loaded.modbus__rs485_mode is True
+    assert loaded.site_details__gateway_points_enabled is True
+
+    bad_cases = [
+        ({"modbus": {"transport": "ascii"}}, "modbus.transport"),
+        ({"modbus": {"baudrate": True}}, "modbus.baudrate"),
+        ({"modbus": {"baudrate": 12345}}, "modbus.baudrate"),
+        ({"modbus": {"bytesize": False}}, "modbus.bytesize"),
+        ({"modbus": {"bytesize": 6}}, "modbus.bytesize"),
+        ({"modbus": {"parity": "X"}}, "modbus.parity"),
+        ({"modbus": {"stopbits": True}}, "modbus.stopbits"),
+        ({"modbus": {"stopbits": 3}}, "modbus.stopbits"),
+        ({"modbus": {"rs485_mode": "true"}}, "modbus.rs485_mode"),
+        ({"modbus": {"poll_port": True}}, "modbus.poll_port"),
+        ({"modbus": {"poll_interval_sec": float("nan")}}, "modbus.poll_interval_sec"),
+        ({"modbus": {"poll_timeout_sec": float("inf")}}, "modbus.poll_timeout_sec"),
+        ({"modbus": {"stale_timeout_sec": True}}, "modbus.stale_timeout_sec"),
+        ({"modbus": {"serial_ports": {"": "/dev/ttyM0"}}}, "serial_ports"),
+        ({"modbus": {"serial_ports": {"ttyM0": ""}}}, "serial_ports"),
+        ({"modbus": {"serial_ports": {"ttyM0": 123}}}, "serial_ports"),
+        ({"site_details": {"gateway_id": "CGW-1", "gateway_points_enabled": "yes", "proxy_ids": {"EM-1": {"type": "PM5561", "modbus_slave_id": 1}}}}, "gateway_points_enabled"),
+        ({"site_details": {"gateway_id": "CGW-1", "proxy_ids": {"EM-1": {"type": "PM5561", "modbus_slave_id": True}}}}, "modbus_slave_id"),
+    ]
+    for idx, (section_override, match_text) in enumerate(bad_cases):
+        bad_cfg = _write_cfg_file(tmp_path, site_dir, section_override, filename=f"bad-{idx}.json")
+        with pytest.raises(GatewayConfigError, match=match_text):
+            ConfigHandler(logging.getLogger("rtu-bad"), types.SimpleNamespace(config_file=str(bad_cfg)))
+
+    no_port_cfg = _write_cfg_file(
+        tmp_path,
+        site_dir,
+        {
+            "internal_broker": {"enabled": False},
+            "modbus": {"poll_mode": "active", "transport": "rtu"},
+            "site_details": {
+                "gateway_id": "CGW-1",
+                "proxy_ids": {"EM-1": {"type": "PM5561", "modbus_slave_id": 1}},
+            },
+        },
+        filename="rtu-missing-port.json",
+    )
+    with pytest.raises(GatewayConfigError, match="requires 'port' or modbus.serial_port"):
+        ConfigHandler(logging.getLogger("rtu-noport"), types.SimpleNamespace(config_file=str(no_port_cfg)))
+
+    no_devices_cfg = _write_cfg_file(
+        tmp_path,
+        site_dir,
+        {
+            "internal_broker": {"enabled": False},
+            "modbus": {"poll_mode": "active", "transport": "rtu", "serial_port": "/dev/ttyM0"},
+            "site_details": {"gateway_id": "CGW-1", "proxy_ids": {}},
+        },
+        filename="rtu-no-devices.json",
+    )
+    with pytest.raises(GatewayConfigError, match="at least one device"):
+        ConfigHandler(logging.getLogger("rtu-nodev"), types.SimpleNamespace(config_file=str(no_devices_cfg)))
+
+
+def test_cli_flag_parity_between_main_and_gcp_handler(tmp_path):
+    import main as entry_main
+
+    site_dir = write_site_model(tmp_path)
+    cfg_path = _write_cfg_file(tmp_path, site_dir, filename="cli-base.json")
+    argv_common = [
+        "--no-internal-broker",
+        "--modbus-poll-mode", "active",
+        "--modbus-transport", "rtu",
+        "--modbus-serial-port", "/dev/ttyM1",
+        "--modbus-baudrate", "38400",
+        "--modbus-parity", "e",
+        "--modbus-stopbits", "2",
+        "--modbus-rs485",
+        "--gateway-points",
+    ]
+    main_args = entry_main.parse_main_cmd_line_args(
+        args=["-c", str(cfg_path)] + argv_common,
+        parents=[
+            gcp_handler.get_google_cloud_cmd_line_parser(),
+            entry_main.get_internal_broker_cmd_line_parser(),
+        ],
+    )
+    gcp_args = gcp_handler.parse_command_line_args(
+        args=["-google-cloud-config-file", str(cfg_path)] + argv_common,
+        parents=[gcp_handler.get_google_cloud_cmd_line_parser()],
+    )
+
+    for parsed in (main_args, gcp_args):
+        assert parsed.internal_broker__enabled is False
+        assert parsed.modbus__poll_mode == "active"
+        assert parsed.modbus__transport == "rtu"
+        assert parsed.modbus__serial_port == "/dev/ttyM1"
+        assert parsed.modbus__baudrate == 38400
+        assert parsed.modbus__parity == "E"
+        assert parsed.modbus__stopbits == 2
+        assert parsed.modbus__rs485_mode is True
+        assert parsed.site_details__gateway_points_enabled is True
+
+        loaded = ConfigHandler(logging.getLogger("cli-override"), parsed)
+        assert loaded.internal_broker__enabled is False
+        assert loaded.modbus__transport == "rtu"
+        assert loaded.modbus__serial_port == "/dev/ttyM1"
+        assert loaded.modbus__baudrate == 38400
+        assert loaded.modbus__parity == "E"
+        assert loaded.modbus__stopbits == 2
+        assert loaded.modbus__rs485_mode is True
+        assert loaded.site_details__gateway_points_enabled is True
+
+    # Omitted flags stay None so JSON config defaults are preserved.
+    default_main = entry_main.parse_main_cmd_line_args(
+        args=["-c", str(cfg_path)],
+        parents=[
+            gcp_handler.get_google_cloud_cmd_line_parser(),
+            entry_main.get_internal_broker_cmd_line_parser(),
+        ],
+    )
+    default_gcp = gcp_handler.parse_command_line_args(
+        args=[],
+        parents=[gcp_handler.get_google_cloud_cmd_line_parser()],
+    )
+    for parsed in (default_main, default_gcp):
+        assert parsed.internal_broker__enabled is None
+        assert parsed.modbus__transport is None
+        assert parsed.modbus__serial_port is None
+        assert parsed.modbus__rs485_mode is None
+        assert parsed.site_details__gateway_points_enabled is None
+
+    enabled_args = entry_main.parse_main_cmd_line_args(
+        args=["--internal-broker-enabled"],
+        parents=[
+            gcp_handler.get_google_cloud_cmd_line_parser(),
+            entry_main.get_internal_broker_cmd_line_parser(),
+        ],
+    )
+    assert enabled_args.internal_broker__enabled is True
+
+
+def test_start_gateway_skips_internal_broker_and_selects_poller_transport(tmp_path, logger, monkeypatch):
+    site_dir = write_site_model(tmp_path)
+    _SpySubscriber.instances = []
+    _SpyTCPPoller.instances = []
+    _SpyRTUPoller.instances = []
+    captured = {}
+
+    monkeypatch.setattr(gcp_handler, "MosquittoMQTTSubscriber", _SpySubscriber)
+    monkeypatch.setattr(gcp_handler, "ModbusTCPPoller", _SpyTCPPoller)
+    monkeypatch.setattr(gcp_handler, "ModbusRTUPoller", _SpyRTUPoller)
+    monkeypatch.setattr(gcp_handler, "GoogleIoTCoreMQTTPublisher", _SpyPublisher)
+    monkeypatch.setattr(gcp_handler, "run_gateway_loop", _fake_loop_capture(captured))
+
+    tcp_cfg = _write_cfg_file(
+        tmp_path,
+        site_dir,
+        {
+            "internal_broker": {"enabled": False},
+            "modbus": {"poll_mode": "active", "transport": "tcp", "poll_port": 1502},
+        },
+        filename="wire-tcp.json",
+    )
+    rc_tcp = gcp_handler.start_google_iot_core_gateway(
+        logger, types.SimpleNamespace(config_file=str(tcp_cfg)), stop_event=threading.Event()
+    )
+    assert rc_tcp == 0
+    assert _SpySubscriber.instances == []
+    assert len(_SpyTCPPoller.instances) == 1
+    assert _SpyTCPPoller.instances[0].started and _SpyTCPPoller.instances[0].stopped
+    assert _SpyRTUPoller.instances == []
+    assert "pointset" not in captured["udmi_handler"].devices_by_id["CGW-1"]["active_subblocks"]
+
+    _SpySubscriber.instances = []
+    _SpyTCPPoller.instances = []
+    _SpyRTUPoller.instances = []
+    captured.clear()
+
+    rtu_cfg = _write_cfg_file(
+        tmp_path,
+        site_dir,
+        {
+            "internal_broker": {"enabled": False},
+            "modbus": {
+                "poll_mode": "active",
+                "transport": "rtu",
+                "serial_ports": {"ttyM0": "/dev/ttyM0"},
+                "baudrate": 19200,
+                "parity": "E",
+                "stopbits": 2,
+                "rs485_mode": True,
+            },
+            "site_details": {
+                "gateway_id": "CGW-1",
+                "gateway_points_enabled": True,
+                "proxy_ids": {"EM-1": {"type": "PM5561", "modbus_slave_id": 1, "port": "ttyM0"}},
+            },
+        },
+        filename="wire-rtu.json",
+    )
+    rc_rtu = gcp_handler.start_google_iot_core_gateway(
+        logger, types.SimpleNamespace(config_file=str(rtu_cfg)), stop_event=threading.Event()
+    )
+    assert rc_rtu == 0
+    assert _SpySubscriber.instances == []
+    assert _SpyTCPPoller.instances == []
+    assert len(_SpyRTUPoller.instances) == 1
+    rtu_poller = _SpyRTUPoller.instances[0]
+    assert rtu_poller.started and rtu_poller.stopped
+    assert rtu_poller.kwargs["baudrate"] == 19200
+    assert rtu_poller.kwargs["parity"] == "E"
+    assert rtu_poller.kwargs["stopbits"] == 2
+    assert rtu_poller.kwargs["rs485_mode"] is True
+    assert rtu_poller.kwargs["serial_ports"] == {"ttyM0": "/dev/ttyM0"}
+    assert "pointset" in captured["udmi_handler"].devices_by_id["CGW-1"]["active_subblocks"]
+

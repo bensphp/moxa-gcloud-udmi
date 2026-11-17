@@ -18,26 +18,36 @@
 - [License](#license)
 
 ## Overview
-The **Moxa GCloud UDMI Integration** (`v4.4.0`) runs on Moxa industrial gateways such as the
-**UC-8220** (Debian 11, Python 3.9). Moxa `MXcloudgate` polls Modbus RTU energy meters (Schneider
-Electric PM5561, PM5111, PM8240, or generic Modbus slaves configured via UDMI `ref`) and publishes
-the raw request/response frames on a local MQTT broker. Optionally, the gateway can also poll a
-Modbus TCP server (such as `ei-modbus` on `127.0.0.1:502`) via `modbus.poll_mode` (`off`,
-`fallback`, or `active`). This gateway decodes those frames and acts as a **UDMI 1.5** gateway (e.g.
+The **Moxa GCloud UDMI Integration** (`v4.5.0`) runs on Moxa industrial gateways such as the
+**UC-8220** (Debian 11, Python 3.9). It supports two Modbus telemetry architectures:
+
+1. **MXcloudgate + Local MQTT Broker (default)**: Moxa `MXcloudgate` polls Modbus RTU energy
+   meters (Schneider Electric PM5561, PM5111, PM8240, or generic Modbus slaves configured via UDMI
+   `ref`) and publishes raw request/response frames on a local MQTT broker (`internal_broker.enabled: true`).
+2. **Broker-Free Direct Polling (`internal_broker.enabled: false`)**:
+   - **Option A — Modbus TCP (`modbus.transport: "tcp"`, e.g. `ei-modbus` on `127.0.0.1:502`)**:
+     polls FC03/FC04 spans directly via `ModbusTCPPoller` with no local MQTT broker needed.
+   - **Option B — Direct RS-485 Serial RTU (`modbus.transport: "rtu"`)**: polls meters directly
+     over POSIX serial / RS-485 ports (e.g. `/dev/ttyM0`) via pure-stdlib `ModbusRTUPoller` with
+     optional Linux `TIOCSRS485` hardware flow control (`modbus.rs485_mode: true`) and no local
+     MQTT broker needed.
+
+This gateway decodes those frames and acts as a **UDMI 1.5** gateway (e.g.
 `CGW-1`) for the proxied meters (e.g. `EM-1`..`EM-3`), towards a **Cloud IoT Core compatible MQTT
 bridge** (`/devices/{id}/...` topics, JWT authentication) or a **UDMI MQTT broker**
 (`/r/{registry}/d/{id}/...` topics).
 
 ```mermaid
 flowchart LR
-    M["MXcloudgate (Modbus gateway)"]
-    B["Local MQTT broker"]
+    M["MXcloudgate / ei-modbus / RS-485 Meters"]
+    B["Local MQTT broker (optional: internal_broker.enabled)"]
     C["Cloud IoT Core compatible bridge or UDMI MQTT broker"]
     subgraph G["moxa-gcloud-udmi"]
-        D["Modbus decoder"] --> U["UDMI state, config and events"]
+        P["Optional TCP / RTU poller"] --> D["Modbus decoder"] --> U["UDMI state, config and events"]
     end
     M -->|"raw Modbus RTU request/response"| B
     B -->|"topic MXcloudgate"| D
+    M <-->|"Option A: Modbus TCP / Option B: RS-485 RTU"| P
     U -->|"state, events"| C
     C -->|"config"| U
 ```
@@ -145,14 +155,14 @@ moxa-gcloud-udmi/
 │       ├── gcp_handler.py                # Start-up and main loop
 │       ├── gcp_publisher.py              # Cloud / UDMI MQTT client
 │       ├── internal_broker_subscriber/   # Local MXcloudgate broker subscriber
-│       ├── modbus_gw/                    # Modbus RTU frame decoder & optional TCP poller
+│       ├── modbus_gw/                    # Modbus RTU frame decoder & optional TCP/RTU pollers
 │       ├── udmi_handler/                 # UDMI state, config, events and health engine
 │       ├── utils/                        # Config, certificates, JWT, logging, persistent stores
 │       └── gcp_manager.py                # Legacy Cloud IoT Core provisioning helper (not used by
 │                                         # the gateway; needs the retired google-cloud-iot package)
 ├── tests/                                # pytest suite (unit + live Mosquitto end-to-end)
 ├── tools/
-│   ├── frame_report.py                   # Pre-deployment check of real MXcloudgate traffic
+│   ├── frame_report.py                   # Pre-deployment check (broker, capture, TCP, or serial)
 │   └── mxcloudgate_simulator.py          # MXcloudgate frame simulator with fault injection
 └── udmi_site_model/                      # Site model templates (see Site Model Requirements)
 ```
@@ -186,9 +196,14 @@ python3 -m venv --system-site-packages .venv      # Debian: needs the python3-ve
 .venv/bin/python -m pip install -r requirements.txt
 ```
 
-Before the first deployment, check the real MXcloudgate traffic (listens only, publishes nothing):
+Before the first deployment, check the real Modbus traffic (reads only, publishes nothing to cloud):
 ```bash
+# Listen to MXcloudgate on the internal MQTT broker:
 python3 tools/frame_report.py -c resources/config-google-gateway.json --live 300 --save frames.jsonl
+
+# Or poll directly without an internal broker (Option A: Modbus TCP / Option B: serial RTU):
+python3 tools/frame_report.py -c resources/config-google-gateway.json --poll-tcp 10 --save frames.jsonl
+python3 tools/frame_report.py -c resources/config-google-gateway.json --poll-serial 10 --save frames.jsonl
 ```
 It reports CRC validity (whether `modbus.crc_check` can stay `strict`), the polled register blocks,
 whether the meter identity registers and all register-map points are polled, "not available"
@@ -201,22 +216,42 @@ model with those of your installation:
 
 | Key | Meaning |
 | :--- | :--- |
-| `internal_broker.*` | Local broker where MXcloudgate publishes (`internal_broker.topic`, default `MXcloudgate`). |
+| `internal_broker.enabled` | `true` (default) to subscribe to the local MXcloudgate broker; `false` (or `--no-internal-broker`) to run broker-free using Option A or Option B. |
+| `internal_broker.*` | Local broker settings (`mqtt_bridge_hostname`, `mqtt_bridge_port`, `topic` default `MXcloudgate`, TLS). Skipped when `internal_broker.enabled` is `false`. |
 | `google_cloud.iot_provider` | `iot_core` (Cloud IoT Core compatible bridge: `/devices/...` topics + JWT) or `mqtt` (UDMI MQTT broker: `/r/<registry>/d/...` topics). |
 | `google_cloud.project_id`, `mqtt_bridge_hostname`, `mqtt_bridge_port`, `enable_tls`, `ca_cert` | Cloud connection. A configured `ca_cert` must exist; the bundled `resources/roots.pem` falls back to the system trust store if missing. |
 | `google_cloud.sample_rate_set` | Default `events/pointset` interval (s; code default 300, shipped template 60) until the config sets `sample_rate_sec`/`sample_limit_sec`. |
 | `google_cloud.jwt_expires_minutes` | JWT lifetime (10-1440, default 60). |
 | `google_cloud.offline_buffer_max_messages` | Max `events/pointset` events buffered across cloud outages (default 500; `0` disables). |
-| `modbus.stale_timeout_sec` | Freshness limit for readings (default 300). Choose more than 2x the MXcloudgate poll interval. |
+| `modbus.stale_timeout_sec` | Freshness limit for readings (default 300). Choose more than 2x the poll interval. |
 | `modbus.crc_check` | `strict` (default) or `off` if your MXcloudgate version does not forward valid CRCs. |
-| `modbus.poll_mode`, `poll_host`, `poll_port`, `poll_interval_sec` | Optional built-in Modbus TCP poller: `off` (default), `fallback` (identity + missing/stale points), or `active` (all configured points). |
+| `modbus.poll_mode` | Built-in poller mode: `off` (default), `fallback` (identity + missing/stale points), or `active` (all configured points). |
+| `modbus.transport` | Built-in poller transport: `tcp` (Option A, default) or `rtu` (Option B direct serial). |
+| `modbus.poll_host`, `poll_port`, `poll_interval_sec`, `poll_timeout_sec` | Option A Modbus TCP target (`127.0.0.1:502` default) and polling cadence/timeout. |
+| `modbus.serial_port`, `serial_ports`, `baudrate`, `bytesize`, `parity`, `stopbits`, `rs485_mode` | Option B serial RTU defaults (`9600`, `8`, `N`, `1`, `rs485_mode: false`), port map (`{"ttyM0": "/dev/ttyM0"}`), and Linux `TIOCSRS485` enablement. |
 | `site_details.gateway_id`, `serial_no`, `hardware`, `localnet.interface` | Gateway identity fallbacks and preferred NIC. `registry_id` and `name` may also be set here if `cloud_iot_config.json` is omitted. |
+| `site_details.gateway_points_enabled` | `false` (default, `CGW-1` has no pointset). Set `true` (or pass `--gateway-points`) to opt in to gateway host metric points (`mem_free_mb`, `mem_total_mb`, `store_free_mb`, `store_total_mb`, `system_load`, `restart_count`). |
 | `site_details.proxy_ids.<id>` | `type` (register map or `generic`), `modbus_slave_id`, optional `port` (e.g. `ttyM0`), optional `hardware`, and optional fallback `serial_no`. Slave ids must be unique. |
 | `environment_setup.udmi_site_model_path`, `resources_path`, `state_dir` | Paths. `state_dir` defaults to systemd's `StateDirectory`, `/var/lib/moxa-gcloud-udmi` or `~/.local/state/moxa-gcloud-udmi`. |
 
 `cloud_region` and `registry_id` from the site model's `cloud_iot_config.json` override the module
 config; command-line options override both. Secrets (`mqtt_password`) are redacted in debug logs.
 Configuration errors make the process exit with status 1.
+
+**Option A — Broker-free Modbus TCP (e.g. `ei-modbus` on `127.0.0.1:502`):**
+```bash
+python3 src/main.py -c resources/config-google-gateway.json \
+  --no-internal-broker --modbus-transport tcp --modbus-poll-mode active \
+  --modbus-poll-host 127.0.0.1 --modbus-poll-port 502 --modbus-poll-interval 10
+```
+
+**Option B — Broker-free direct RS-485 serial RTU:**
+```bash
+python3 src/main.py -c resources/config-google-gateway.json \
+  --no-internal-broker --modbus-transport rtu --modbus-poll-mode active \
+  --modbus-serial-port /dev/ttyM0 --modbus-baudrate 9600 --modbus-parity N \
+  --modbus-stopbits 1 --modbus-rs485
+```
 
 Place the gateway private key (`rsa_private.pem` or `ec_private.pem`) in
 `udmi_site_model/devices/<gateway_id>/` and register the matching public key in the cloud registry.
@@ -225,13 +260,16 @@ Place the gateway private key (`rsa_private.pem` or `ec_private.pem`) in
 The UDMI sequencer compares what the gateway reports with the site model, so the site model must
 describe the real installation:
 - **Meters**: `system.serial_no`, `hardware`, `software.firmware` must match what the meter reports.
-  Configure MXcloudgate to poll the identity registers (30-89, 130 or 117, 1637 or 1717) as well as
-  the measurement registers. `pointset.points` should list every point of the register map (that is
-  what self-enumeration returns); refs use the grammar above, e.g. `3/3028/2?type=FLOAT32` with
-  `localnet.families.modbus` = `{"addr": "<port>", "unitid": "<slave id>"}`.
+  Configure MXcloudgate (or use `modbus.poll_mode: "active"` / `"fallback"`) to poll the identity
+  registers (30-89, 130 or 117, 1637 or 1717) as well as the measurement registers. `pointset.points`
+  should list every point of the register map (that is what self-enumeration returns); refs use the
+  grammar above, e.g. `3/3028/2?type=FLOAT32` with `localnet.families.modbus` =
+  `{"addr": "<port>", "unitid": "<slave id>"}`.
 - **Gateway**: `localnet.families` must contain only the gateway's real addresses (no `ipv6` unless
-  it has a global IPv6 address); `software` must match the running version (`{"firmware": "4.4.0"}`).
-  The gateway has no points, so it has no `pointset` block.
+  it has a global IPv6 address); `software` must match the running version (`{"firmware": "4.5.0"}`).
+  By default (`site_details.gateway_points_enabled: false`), the gateway has no points and no
+  `pointset` block; if `gateway_points_enabled: true` (or `metadata.json` declares `pointset.points`),
+  the gateway reports host diagnostic points under `pointset`.
 - **Features** must equal what the code implements:
   - gateway: `system` (stable), `gateway`, `system.mode`, `enumeration`, `enumeration.families`,
     `enumeration.features` (beta);

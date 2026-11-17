@@ -16,6 +16,13 @@ from google_iot_core_gateway.gcp_publisher import GoogleIoTCoreMQTTPublisher
 from google_iot_core_gateway.internal_broker_subscriber.internal_broker_subscriber import (
     MosquittoMQTTSubscriber,
 )
+from google_iot_core_gateway.modbus_gw.modbus_rtu_poller import (
+    MODBUS_TRANSPORTS,
+    ModbusRTUPoller,
+    VALID_BAUDRATES,
+    VALID_PARITIES,
+    VALID_STOPBITS,
+)
 from google_iot_core_gateway.modbus_gw.modbus_tcp_poller import POLL_MODES, ModbusTCPPoller
 from google_iot_core_gateway.modbus_gw.modbus_to_json import decode_modbus_frame
 from google_iot_core_gateway.runner import run_gateway_process
@@ -137,6 +144,13 @@ def get_google_cloud_cmd_line_parser():
         metavar="SERIAL_NO",
         help="Gateway serial number, used when the hardware does not expose one",
     )
+    group.add_argument(
+        "--gateway-points",
+        dest="site_details__gateway_points_enabled",
+        action="store_true",
+        default=None,
+        help="Enable opt-in host diagnostic UDMI pointset on the gateway device",
+    )
 
     group = parser.add_argument_group("Modbus poller settings")
     group.add_argument(
@@ -145,7 +159,15 @@ def get_google_cloud_cmd_line_parser():
         dest="modbus__poll_mode",
         type=str,
         choices=list(POLL_MODES),
-        help="Optional built-in Modbus TCP poller mode: 'off' (default), 'fallback', or 'active'",
+        help="Optional built-in Modbus poller mode (TCP or RTU): 'off' (default), 'fallback', or 'active'",
+    )
+    group.add_argument(
+        "--modbus-transport",
+        dest="modbus__transport",
+        type=str.lower,
+        choices=list(MODBUS_TRANSPORTS),
+        default=None,
+        help="Built-in Modbus poller transport: 'tcp' (default) or 'rtu'",
     )
     group.add_argument(
         "-modbus-poll-host",
@@ -169,7 +191,47 @@ def get_google_cloud_cmd_line_parser():
         dest="modbus__poll_interval_sec",
         type=float,
         metavar="SECONDS",
-        help="Built-in Modbus TCP polling interval in seconds. Default [10]",
+        help="Built-in Modbus polling interval in seconds. Default [10]",
+    )
+    group.add_argument(
+        "--modbus-serial-port",
+        dest="modbus__serial_port",
+        type=str,
+        default=None,
+        metavar="PORT",
+        help="Default POSIX serial/RS-485 device path or name for Modbus RTU polling (e.g. ttyM0 or /dev/ttyM0)",
+    )
+    group.add_argument(
+        "--modbus-baudrate",
+        dest="modbus__baudrate",
+        type=int,
+        choices=list(VALID_BAUDRATES),
+        default=None,
+        metavar="BAUDRATE",
+        help="Modbus RTU serial baud rate. Default [9600]",
+    )
+    group.add_argument(
+        "--modbus-parity",
+        dest="modbus__parity",
+        type=str.upper,
+        choices=list(VALID_PARITIES),
+        default=None,
+        help="Modbus RTU serial parity ('N', 'E', 'O'). Default ['N']",
+    )
+    group.add_argument(
+        "--modbus-stopbits",
+        dest="modbus__stopbits",
+        type=int,
+        choices=list(VALID_STOPBITS),
+        default=None,
+        help="Modbus RTU serial stop bits (1 or 2). Default [1]",
+    )
+    group.add_argument(
+        "--modbus-rs485",
+        dest="modbus__rs485_mode",
+        action="store_true",
+        default=None,
+        help="Enable Linux TIOCSRS485 transceiver mode on Modbus RTU serial ports",
     )
 
     group = parser.add_argument_group("Environment settings")
@@ -203,6 +265,21 @@ def get_google_cloud_cmd_line_parser():
 def parse_command_line_args(args=None, parents=None):
     """Parse command-line arguments when module is invoked standalone."""
     parser = argparse.ArgumentParser(allow_abbrev=False, add_help=True, parents=parents or [])
+    broker_toggle = parser.add_mutually_exclusive_group()
+    broker_toggle.add_argument(
+        "--internal-broker-enabled",
+        dest="internal_broker__enabled",
+        action="store_true",
+        default=None,
+        help="Enable the internal MXcloudgate MQTT broker subscriber",
+    )
+    broker_toggle.add_argument(
+        "--no-internal-broker",
+        dest="internal_broker__enabled",
+        action="store_false",
+        default=argparse.SUPPRESS,
+        help="Disable the internal MXcloudgate MQTT broker subscriber",
+    )
     parser.add_argument(
         "-internal-broker-hostname",
         dest="internal_broker__mqtt_bridge_hostname",
@@ -336,6 +413,7 @@ def _get_udmi_handler(logger, config, restart_count=1):
         localnet_config=config.site_details__localnet,
         restart_count=restart_count,
         hardware=config.site_details__hardware,
+        gateway_points_enabled=config.site_details__gateway_points_enabled,
     )
     return udmi_handler
 
@@ -352,8 +430,12 @@ def process_payloads(logger, google_iot_core_queue, udmi_handler, max_batch=64, 
     Drain up to `max_batch` MXcloudgate Modbus RTU messages from the internal broker queue and
     apply them to the proxied devices.
     """
-    if hasattr(udmi_handler, "get_decoder_maps"):
-        slave_to_type, dbo_maps = udmi_handler.get_decoder_maps()
+    try:
+        get_decoder_maps = udmi_handler.get_decoder_maps
+    except AttributeError:
+        get_decoder_maps = None
+    if callable(get_decoder_maps):
+        slave_to_type, dbo_maps = get_decoder_maps()
     else:
         slave_to_type, dbo_maps = udmi_handler.get_meter_types(), udmi_handler.dbo_maps
     processed = 0
@@ -367,6 +449,8 @@ def process_payloads(logger, google_iot_core_queue, udmi_handler, max_batch=64, 
 
         try:
             frame_msg = json.loads(raw_item)
+            if not isinstance(frame_msg, dict):
+                raise ValueError("Frame payload must be a JSON object")
             rtu_request = bytes.fromhex(frame_msg["rtu_request"])
             rtu_response = bytes.fromhex(frame_msg["rtu_response"])
             payload = decode_modbus_frame(
@@ -421,7 +505,10 @@ def process_gateway_errors(google_iot_core_publisher, udmi_handler):
 
 def _publish(logger, publisher, stats, device_id, payload, topic):
     info = publisher.publish(device_id, payload, topic=topic)
-    rc = getattr(info, "rc", mqtt.MQTT_ERR_SUCCESS)
+    try:
+        rc = info.rc
+    except AttributeError:
+        rc = mqtt.MQTT_ERR_SUCCESS
     if rc == mqtt.MQTT_ERR_SUCCESS:
         if stats is not None:
             stats[topic] = stats.get(topic, 0) + 1
@@ -456,16 +543,26 @@ def publish_due_udmi_messages(
                 logger, google_iot_core_publisher, stats, device_id, sys_event_payload, "events/system"
             )
             infos.append(info)
-            if rc != mqtt.MQTT_ERR_SUCCESS and hasattr(udmi_handler, "system_event_publish_failed"):
-                udmi_handler.system_event_publish_failed(device_id, sys_event_payload)
+            if rc != mqtt.MQTT_ERR_SUCCESS:
+                try:
+                    sys_failed_fn = udmi_handler.system_event_publish_failed
+                except AttributeError:
+                    sys_failed_fn = None
+                if callable(sys_failed_fn):
+                    sys_failed_fn(device_id, sys_event_payload)
 
         for disc_payload in udmi_handler.pop_due_discovery_events(device_id):
             info, rc = _publish(
                 logger, google_iot_core_publisher, stats, device_id, disc_payload, "events/discovery"
             )
             infos.append(info)
-            if rc != mqtt.MQTT_ERR_SUCCESS and hasattr(udmi_handler, "discovery_event_publish_failed"):
-                udmi_handler.discovery_event_publish_failed(device_id, disc_payload)
+            if rc != mqtt.MQTT_ERR_SUCCESS:
+                try:
+                    disc_failed_fn = udmi_handler.discovery_event_publish_failed
+                except AttributeError:
+                    disc_failed_fn = None
+                if callable(disc_failed_fn):
+                    disc_failed_fn(device_id, disc_payload)
 
         state_payload = udmi_handler.pop_due_state_payload(device_id, now_mono=now_mono)
         if state_payload is not None:
@@ -612,8 +709,9 @@ def run_gateway_loop(
 
 def start_google_iot_core_gateway(logger, args, root_dir=None, stop_event=None):
     """
-    Run the gateway: connect to the internal MXcloudgate broker and the upstream MQTT bridge,
-    process Modbus telemetry and downlink UDMI configs, and publish UDMI messages.
+    Run the gateway: optionally connect to the internal MXcloudgate broker and/or run the built-in
+    Modbus TCP/RTU poller, connect to the upstream MQTT bridge, process Modbus telemetry and downlink
+    UDMI configs, and publish UDMI messages.
 
     Returns a process exit code (EXIT_OK, EXIT_FATAL or EXIT_RESTART).
     """
@@ -627,41 +725,61 @@ def start_google_iot_core_gateway(logger, args, root_dir=None, stop_event=None):
             logger, config.state_dir, max_messages=config.google_cloud__offline_buffer_max_messages
         )
         google_iot_core_queue = queue.Queue(maxsize=500)
-        int_broker_subscriber = MosquittoMQTTSubscriber(
-            logger,
-            google_iot_core_queue,
-            config.internal_broker__mqtt_bridge_hostname,
-            config.internal_broker__mqtt_bridge_port,
-            config.internal_broker__trusted_root_ca,
-            config.internal_broker__x509_certificate,
-            config.internal_broker__private_key,
-            config.internal_broker__tls_insecure_set,
-            config.internal_broker__enable_tls,
-            topic=config.internal_broker__topic,
-        )
-    except GatewayConfigError as exc:
+        int_broker_subscriber = None
+        if config.internal_broker__enabled:
+            int_broker_subscriber = MosquittoMQTTSubscriber(
+                logger,
+                google_iot_core_queue,
+                config.internal_broker__mqtt_bridge_hostname,
+                config.internal_broker__mqtt_bridge_port,
+                config.internal_broker__trusted_root_ca,
+                config.internal_broker__x509_certificate,
+                config.internal_broker__private_key,
+                config.internal_broker__tls_insecure_set,
+                config.internal_broker__enable_tls,
+                topic=config.internal_broker__topic,
+            )
+
+        modbus_poller = None
+        if config.modbus__poll_mode != "off":
+            if config.modbus__transport == "rtu":
+                modbus_poller = ModbusRTUPoller(
+                    logger,
+                    google_iot_core_queue,
+                    udmi_handler,
+                    mode=config.modbus__poll_mode,
+                    interval_sec=config.modbus__poll_interval_sec,
+                    timeout_sec=config.modbus__poll_timeout_sec,
+                    default_port=config.modbus__serial_port,
+                    serial_ports=config.modbus__serial_ports,
+                    baudrate=config.modbus__baudrate,
+                    bytesize=config.modbus__bytesize,
+                    parity=config.modbus__parity,
+                    stopbits=config.modbus__stopbits,
+                    rs485_mode=config.modbus__rs485_mode,
+                )
+            else:
+                modbus_poller = ModbusTCPPoller(
+                    logger,
+                    google_iot_core_queue,
+                    udmi_handler,
+                    host=config.modbus__poll_host,
+                    port=config.modbus__poll_port,
+                    mode=config.modbus__poll_mode,
+                    interval_sec=config.modbus__poll_interval_sec,
+                    timeout_sec=config.modbus__poll_timeout_sec,
+                )
+    except (GatewayConfigError, ValueError) as exc:
         logger.error(f"Fatal configuration error: {exc}")
         return EXIT_FATAL
 
-    modbus_poller = None
-    if config.modbus__poll_mode != "off":
-        modbus_poller = ModbusTCPPoller(
-            logger,
-            google_iot_core_queue,
-            udmi_handler,
-            host=config.modbus__poll_host,
-            port=config.modbus__poll_port,
-            mode=config.modbus__poll_mode,
-            interval_sec=config.modbus__poll_interval_sec,
-            timeout_sec=config.modbus__poll_timeout_sec,
-        )
-
-    int_broker_subscriber.run()
-    if modbus_poller is not None:
-        modbus_poller.start()
-    google_iot_core_publisher.start()
-
     try:
+        if int_broker_subscriber is not None:
+            int_broker_subscriber.run()
+        if modbus_poller is not None:
+            modbus_poller.start()
+        google_iot_core_publisher.start()
+
         return run_gateway_loop(
             logger,
             config,
@@ -674,7 +792,8 @@ def start_google_iot_core_gateway(logger, args, root_dir=None, stop_event=None):
     finally:
         if modbus_poller is not None:
             modbus_poller.stop()
-        int_broker_subscriber.stop()
+        if int_broker_subscriber is not None:
+            int_broker_subscriber.stop()
         google_iot_core_publisher.close()
         pointset_buffer.close()
 

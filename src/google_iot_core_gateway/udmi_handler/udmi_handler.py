@@ -16,6 +16,7 @@ import collections
 import copy
 import datetime
 import json
+import math
 import os
 import re
 import socket
@@ -103,6 +104,15 @@ PROXY_FEATURES = {
     "enumeration.pointset": {"stage": "beta"},
 }
 
+GATEWAY_HOST_POINTS = {
+    "mem_free_mb": "Megabytes",
+    "mem_total_mb": "Megabytes",
+    "store_free_mb": "Megabytes",
+    "store_total_mb": "Megabytes",
+    "system_load": "No-units",
+    "restart_count": "No-units",
+}
+
 # Modbus exception codes that describe a persistent problem with the requested registers. Other
 # codes (busy, gateway timeouts, ...) are transient and only matter if they persist long enough
 # for the affected points to go stale.
@@ -170,6 +180,23 @@ def group_register_spans(spans, max_registers: int = 100, max_gap: int = 10) -> 
         else:
             blocks.append([first, last])
     return [(first, last - first + 1) for first, last in blocks]
+
+
+def group_fc_register_spans(fc_spans, max_registers: int = 100, max_gap: int = 10) -> list:
+    """Group (fc, start_register_1based, count) spans per fc into sorted [(fc, start, qty)]."""
+    by_fc = {}
+    for fc, reg, cnt in fc_spans:
+        cnt_int = int(cnt)
+        if cnt_int <= 0:
+            continue
+        by_fc.setdefault(int(fc), []).append((int(reg), cnt_int))
+    grouped = []
+    for fc_int in sorted(by_fc):
+        for start_reg, qty in group_register_spans(
+            by_fc[fc_int], max_registers=max_registers, max_gap=max_gap
+        ):
+            grouped.append((fc_int, start_reg, qty))
+    return grouped
 
 
 def _normalize_units(units) -> str:
@@ -571,10 +598,13 @@ class UDMIHandler:
             "next_pointset_mono": now_mono + min(2.0, self.default_sample_rate_sec),
             "known_points": {},
             "known_registers": {},
+            "legacy_known_regs": set(),
+            "fc3_configured_regs": set(),
             "dynamic_registers": {},
             "dynamic_conflicts": {},
             "configured_points": {},
             "register_slots": {},
+            "gateway_points_enabled": False,
             "point_sigs": {},
             "point_entries": {},
             "meta_unit_in_context": False,
@@ -626,6 +656,7 @@ class UDMIHandler:
         localnet_config: dict = None,
         restart_count: int = 1,
         hardware: dict = None,
+        gateway_points_enabled: bool = False,
     ) -> bool:
         """Register the gateway device itself (e.g. CGW-1) as a first-class UDMI device."""
         with self._lock:
@@ -679,10 +710,32 @@ class UDMIHandler:
             )
 
             if proxy_ids is not None:
-                record["configured_proxy_ids"] = [str(p) for p in proxy_ids]
+                record["configured_proxy_ids"] = [str(proxy_id) for proxy_id in proxy_ids]
             else:
                 gw_meta_proxies = ((metadata or {}).get("gateway") or {}).get("proxy_ids") or []
-                record["configured_proxy_ids"] = [str(p) for p in gw_meta_proxies]
+                record["configured_proxy_ids"] = [str(proxy_id) for proxy_id in gw_meta_proxies]
+
+            meta_points = ((metadata or {}).get("pointset") or {}).get("points")
+            has_meta_points = isinstance(meta_points, dict) and bool(meta_points)
+            points_enabled = bool(gateway_points_enabled) or has_meta_points
+            record["gateway_points_enabled"] = points_enabled
+            if points_enabled:
+                record["supported_features"]["pointset"] = {"stage": "stable"}
+                record["supported_features"]["enumeration.pointset"] = {"stage": "preview"}
+                record["active_subblocks"].add("pointset")
+                for metric_name, metric_units in GATEWAY_HOST_POINTS.items():
+                    record["known_points"][metric_name] = {
+                        "host_metric": metric_name,
+                        "units": metric_units,
+                    }
+                if has_meta_points:
+                    record["configured_points"] = {
+                        str(name): dict(spec) if isinstance(spec, dict) else {}
+                        for name, spec in meta_points.items()
+                    }
+                else:
+                    record["configured_points"] = {name: {} for name in GATEWAY_HOST_POINTS}
+                self._refresh_health_locked(record, time.monotonic())
 
             self._queue_log_locked(
                 record,
@@ -788,6 +841,7 @@ class UDMIHandler:
                 if not dbo_name or not str(reg_str).isdigit():
                     continue
                 reg_int = int(reg_str)
+                reg_fc = int(spec.get("fc", 3))
                 fmt = str(spec.get("format", "")).lower()
                 pt_spec = {
                     "register": reg_int,
@@ -795,10 +849,16 @@ class UDMIHandler:
                     "format": fmt,
                     "modbus_type": "ASCII" if fmt.startswith("str") else _FORMAT_TO_MODBUS_TYPE.get(fmt),
                     "units": spec.get("units"),
+                    "fc": reg_fc,
                 }
                 record["known_points"][dbo_name] = pt_spec
                 record["known_registers"][reg_int] = pt_spec
-                record["register_slots"][reg_int] = self._new_point_slot()
+                if "fc" not in spec or spec.get("fc") is None:
+                    record["legacy_known_regs"].add(reg_int)
+                slot = self._new_point_slot()
+                record["register_slots"][(reg_fc, reg_int)] = slot
+                if reg_fc == 3:
+                    record["register_slots"][reg_int] = slot
 
             # Until the first config arrives, report the points the site model expects.
             meta_points = ((metadata_dict.get("pointset") or {}).get("points")) or {}
@@ -859,16 +919,68 @@ class UDMIHandler:
                     custom_maps = dict(self._modbus_dbo_map)
                 synthetic_key = f"__dev_{slave_key}"
                 merged = dict(self._modbus_dbo_map.get(base_type) or {})
-                for reg_addr, spec in dyn.items():
-                    merged[str(reg_addr)] = {
-                        "dbo_name": f"__dyn_{reg_addr}",
+                for dyn_key, spec in dyn.items():
+                    if isinstance(dyn_key, tuple) and len(dyn_key) == 2:
+                        fc, reg_addr = int(dyn_key[0]), int(dyn_key[1])
+                    else:
+                        fc, reg_addr = int(spec.get("fc", 3)), int(dyn_key)
+                    entry = {
+                        "dbo_name": f"__dyn_{fc}_{reg_addr}",
                         "number_of_registers": spec["num_registers"],
                         "format": spec["format"],
                         "units": spec.get("units") or "No-units",
+                        "fc": fc,
                     }
+                    merged[f"{fc}:{reg_addr}"] = entry
+                    if str(reg_addr) not in merged:
+                        merged[str(reg_addr)] = entry
                 custom_maps[synthetic_key] = merged
                 slave_to_type[slave_int] = synthetic_key
             return slave_to_type, (custom_maps if custom_maps is not None else dbo_maps)
+
+    def _collect_device_poll_spans_locked(self, dev: dict, poll_mode: str, now: float, fallback_age: float) -> list:
+        """Collect [(fc, start_reg_1based, qty)] spans due for one proxied device."""
+        fc_spans = []
+        if dev["configured_points"]:
+            point_specs = []
+            for pt_name, pt_cfg in dev["configured_points"].items():
+                err_state, _err_status, pt_info = self._resolve_point_locked(dev, pt_name, pt_cfg)
+                if err_state is None and pt_info is not None and "register" in pt_info:
+                    point_specs.append(pt_info)
+        elif not dev["has_received_config"]:
+            point_specs = list(dev["known_registers"].values())
+        else:
+            point_specs = []
+
+        for pt_info in point_specs:
+            pt_fc = int(pt_info.get("fc", 3))
+            if poll_mode == "active":
+                fc_spans.append((pt_fc, pt_info["register"], pt_info["num_registers"]))
+            else:
+                slot = dev["register_slots"].get((pt_fc, pt_info["register"]))
+                if slot is None and pt_fc == 3:
+                    slot = dev["register_slots"].get(pt_info["register"])
+                updated = slot["updated_mono"] if slot else None
+                if updated is None or (now - updated) >= fallback_age:
+                    fc_spans.append((pt_fc, pt_info["register"], pt_info["num_registers"]))
+
+        sys_map = (self._modbus_dbo_map.get(dev["device_type"]) or {}).get("system") or {}
+        if sys_map:
+            last_id = dev.get("last_identity_poll_mono")
+            if poll_mode == "active":
+                need_identity = last_id is None or (now - last_id) >= 300.0
+            else:
+                need_identity = not dev.get("identity_complete", False) and (
+                    last_id is None or (now - last_id) >= fallback_age
+                )
+            if need_identity:
+                dev["last_identity_poll_mono"] = now
+                for reg_str, spec in sys_map.items():
+                    if str(reg_str).isdigit() and isinstance(spec, dict) and "number_of_registers" in spec:
+                        fc_spans.append(
+                            (int(spec.get("fc", 3)), int(reg_str), int(spec["number_of_registers"]))
+                        )
+        return fc_spans
 
     def get_poll_targets(self, mode: str, now_mono: float = None, poll_interval_sec: float = 10.0) -> list:
         """Return [(slave_id_int, [(start_reg_1based, qty), ...])] due for Modbus TCP polling."""
@@ -883,48 +995,47 @@ class UDMIHandler:
                 dev = self.devices_by_id.get(device_id)
                 if dev is None or dev["is_gateway"]:
                     continue
-                spans = []
-                if dev["configured_points"]:
-                    point_specs = []
-                    for pt_name, pt_cfg in dev["configured_points"].items():
-                        err_state, _err_status, pt_info = self._resolve_point_locked(dev, pt_name, pt_cfg)
-                        if err_state is None and pt_info is not None:
-                            point_specs.append(pt_info)
-                elif not dev["has_received_config"]:
-                    point_specs = list(dev["known_registers"].values())
-                else:
-                    point_specs = []
-
-                for pt_info in point_specs:
-                    if poll_mode == "active":
-                        spans.append((pt_info["register"], pt_info["num_registers"]))
-                    else:
-                        slot = dev["register_slots"].get(pt_info["register"])
-                        updated = slot["updated_mono"] if slot else None
-                        if updated is None or (now - updated) >= fallback_age:
-                            spans.append((pt_info["register"], pt_info["num_registers"]))
-
-                sys_map = (self._modbus_dbo_map.get(dev["device_type"]) or {}).get("system") or {}
-                if sys_map:
-                    last_id = dev.get("last_identity_poll_mono")
-                    if poll_mode == "active":
-                        need_identity = last_id is None or (now - last_id) >= 300.0
-                    else:
-                        need_identity = not dev.get("identity_complete", False) and (
-                            last_id is None or (now - last_id) >= fallback_age
-                        )
-                    if need_identity:
-                        dev["last_identity_poll_mono"] = now
-                        for reg_str, spec in sys_map.items():
-                            if str(reg_str).isdigit() and isinstance(spec, dict) and "number_of_registers" in spec:
-                                spans.append((int(reg_str), int(spec["number_of_registers"])))
-
-                blocks = group_register_spans(sorted(set(spans)))
+                fc_spans = self._collect_device_poll_spans_locked(dev, poll_mode, now, fallback_age)
+                blocks = group_register_spans(sorted({(reg, qty) for (_fc, reg, qty) in fc_spans}))
                 if blocks:
                     targets.append((dev["slave_id_int"], blocks))
             return targets
 
+    def get_poll_plan(self, mode: str, now_mono: float = None, poll_interval_sec: float = 10.0) -> list:
+        """Return per-device poll plan with function codes and port names for TCP/RTU pollers."""
+        poll_mode = str(mode or "off").lower()
+        if poll_mode == "off":
+            return []
+        with self._lock:
+            now = time.monotonic() if now_mono is None else now_mono
+            fallback_age = max(float(poll_interval_sec) * 2.0, min(self.stale_timeout_sec * 0.5, 60.0))
+            plan = []
+            for device_id in self.get_active_device_ids():
+                dev = self.devices_by_id.get(device_id)
+                if dev is None or dev["is_gateway"]:
+                    continue
+                fc_spans = self._collect_device_poll_spans_locked(dev, poll_mode, now, fallback_age)
+                blocks = group_fc_register_spans(sorted(set(fc_spans)))
+                if blocks:
+                    plan.append(
+                        {
+                            "device_id": device_id,
+                            "slave_id": dev["slave_id_int"],
+                            "port": dev.get("port"),
+                            "blocks": blocks,
+                        }
+                    )
+            return plan
+
     # --------------------------------------------------------------- point refs
+
+    @staticmethod
+    def _point_failure(point_name: str, reason: str) -> tuple:
+        return (
+            "failure",
+            (CATEGORY_POINTSET_POINT_FAILURE, LEVEL_ERROR, f"Point {point_name}: {reason}"),
+            None,
+        )
 
     def _resolve_point_locked(self, dev: dict, point_name: str, pt_cfg):
         """Resolve `point_name` + `pt_cfg` to `(error_state, status_tuple, pt_info)`."""
@@ -944,61 +1055,72 @@ class UDMIHandler:
                 )
             return None, None, pt_info
 
-        def _failure(reason: str):
-            return (
-                "failure",
-                (CATEGORY_POINTSET_POINT_FAILURE, LEVEL_ERROR, f"Point {point_name}: {reason}"),
-                None,
+        if dev.get("is_gateway"):
+            return self._point_failure(
+                point_name, f"host metric point does not support external ref '{ref_val}'"
             )
 
         try:
             parsed = parse_modbus_ref(ref_val, unit_from_context=dev.get("unit_in_context", False))
         except ValueError as exc:
-            return _failure(f"invalid modbus ref '{ref_val}': {exc}")
+            return self._point_failure(point_name, f"invalid modbus ref '{ref_val}': {exc}")
 
         params = parsed["params"]
         if not parsed["legacy"]:
             if parsed["unitid"] is not None and parsed["unitid"] != dev.get("slave_id_int"):
-                return _failure(
-                    f"unit id {parsed['unitid']} does not match modbus_slave_id {dev.get('slave_id_int')}"
+                return self._point_failure(
+                    point_name,
+                    f"unit id {parsed['unitid']} does not match modbus_slave_id {dev.get('slave_id_int')}",
                 )
             if parsed["addr"] is not None and parsed["addr"] not in dev.get("valid_target_addrs", ()):
-                return _failure(
-                    f"modbus address '{parsed['addr']}' is not how this gateway reaches the device"
+                return self._point_failure(
+                    point_name,
+                    f"modbus address '{parsed['addr']}' is not how this gateway reaches the device",
                 )
             if parsed["fc"] not in _MODBUS_READ_FCS:
-                return _failure(
-                    f"function code {parsed['fc']} is not supported (FC03/FC04 reads only)"
+                return self._point_failure(
+                    point_name,
+                    f"function code {parsed['fc']} is not supported (FC03/FC04 reads only)",
                 )
             if params.get("worder", "HWF") != "HWF":
-                return _failure(
-                    "word order LWF is not supported (registers are decoded high word first)"
+                return self._point_failure(
+                    point_name,
+                    "word order LWF is not supported (registers are decoded high word first)",
                 )
             if params.get("border", "MSB") != "MSB":
-                return _failure("byte order LSB is not supported")
+                return self._point_failure(point_name, "byte order LSB is not supported")
             if float(params.get("scale", 1.0)) != 1.0 or float(params.get("offset", 0.0)) != 0.0:
-                return _failure("scale/offset interpretation is not supported")
+                return self._point_failure(
+                    point_name, "scale/offset interpretation is not supported"
+                )
             mod_type = params.get("type")
             if mod_type in _MODBUS_TYPE_SPECS and parsed["quantity"] is not None:
                 expected_qty = _MODBUS_TYPE_SPECS[mod_type][1]
                 if parsed["quantity"] != expected_qty:
-                    return _failure(
-                        f"quantity {parsed['quantity']} does not match {mod_type} ({expected_qty} registers)"
+                    return self._point_failure(
+                        point_name,
+                        f"quantity {parsed['quantity']} does not match {mod_type} ({expected_qty} registers)",
                     )
 
         reg = parsed["address"]
-        if reg in dev["known_registers"]:
-            pt_info = dev["known_registers"][reg]
+        known_pt = dev["known_registers"].get(reg)
+        if known_pt is not None and (
+            parsed["legacy"] or parsed["fc"] == int(known_pt.get("fc", 3))
+        ):
+            pt_info = known_pt
             if not parsed["legacy"]:
                 if parsed["quantity"] is not None and parsed["quantity"] != pt_info["num_registers"]:
-                    return _failure(
-                        f"quantity {parsed['quantity']} does not match {pt_info['num_registers']} registers"
+                    return self._point_failure(
+                        point_name,
+                        f"quantity {parsed['quantity']} does not match {pt_info['num_registers']} registers",
                     )
                 if "type" in params and params["type"] != pt_info["modbus_type"]:
-                    return _failure(
-                        f"type {params['type']} does not match register type {pt_info['modbus_type']}"
+                    return self._point_failure(
+                        point_name,
+                        f"type {params['type']} does not match register type {pt_info['modbus_type']}",
                     )
-            return None, None, pt_info
+                return None, None, dict(pt_info, fc=parsed["fc"])
+            return None, None, dict(pt_info)
 
         mod_type = params.get("type")
         qty = parsed["quantity"]
@@ -1006,19 +1128,25 @@ class UDMIHandler:
             qty = _MODBUS_TYPE_SPECS[mod_type][1]
         if qty is None:
             qty = 1
+        req_fc = parsed["fc"] if parsed["fc"] is not None else 3
         for k_reg, k_info in dev["known_registers"].items():
+            if int(k_info.get("fc", 3)) != req_fc:
+                continue
             k_end = k_reg + k_info["num_registers"] - 1
             if reg <= k_end and reg + qty - 1 >= k_reg:
-                return _failure(f"register {reg} overlaps mapped register {k_reg}")
+                return self._point_failure(
+                    point_name, f"register {reg} overlaps mapped register {k_reg}"
+                )
 
         if parsed["legacy"] or parsed["quantity"] is None or mod_type not in _MODBUS_TYPE_SPECS:
-            return _failure(
-                f"register {reg} is not in the meter register map and ref lacks explicit numeric quantity and type"
+            return self._point_failure(
+                point_name,
+                f"register {reg} is not in the meter register map and ref lacks explicit numeric quantity and type",
             )
 
         conflict = (dev.get("dynamic_conflicts") or {}).get(point_name)
         if conflict:
-            return _failure(conflict)
+            return self._point_failure(point_name, conflict)
 
         fmt, _expected_qty = _MODBUS_TYPE_SPECS[mod_type]
         return (
@@ -1030,6 +1158,7 @@ class UDMIHandler:
                 "format": fmt,
                 "modbus_type": mod_type,
                 "units": None,
+                "fc": parsed["fc"],
             },
         )
 
@@ -1039,16 +1168,22 @@ class UDMIHandler:
         dev["dynamic_conflicts"] = {}
         new_dynamic = {}
         new_conflicts = {}
+        fc3_regs = set()
 
         for pt_name, pt_cfg in dev["configured_points"].items():
             err_state, _err_status, pt_info = self._resolve_point_locked(dev, pt_name, pt_cfg)
-            if err_state is not None or pt_info is None:
+            if err_state is not None or pt_info is None or "register" not in pt_info:
                 continue
+            fc = int(pt_info.get("fc", 3))
             reg = pt_info["register"]
-            if reg in dev["known_registers"]:
+            if fc == 3:
+                fc3_regs.add(reg)
+            known_info = dev["known_registers"].get(reg)
+            if known_info is not None and int(known_info.get("fc", 3)) == fc:
                 continue
-            if reg in new_dynamic:
-                existing = new_dynamic[reg]
+            dyn_key = (fc, reg)
+            if dyn_key in new_dynamic:
+                existing = new_dynamic[dyn_key]
                 if (existing["num_registers"], existing["format"]) != (
                     pt_info["num_registers"],
                     pt_info["format"],
@@ -1058,29 +1193,44 @@ class UDMIHandler:
                     )
                 continue
             overlaps = False
-            for o_reg, o_info in new_dynamic.items():
+            for (o_fc, o_reg), o_info in new_dynamic.items():
+                if o_fc != fc:
+                    continue
                 if reg <= o_reg + o_info["num_registers"] - 1 and reg + pt_info["num_registers"] - 1 >= o_reg:
                     new_conflicts[pt_name] = f"register {reg} overlaps configured dynamic register {o_reg}"
                     overlaps = True
                     break
             if not overlaps:
-                new_dynamic[reg] = pt_info
+                new_dynamic[dyn_key] = dict(pt_info, fc=fc)
 
-        for old_reg, old_info in old_dynamic.items():
-            new_info = new_dynamic.get(old_reg)
+        for old_key, old_info in old_dynamic.items():
+            new_info = new_dynamic.get(old_key)
             if new_info is None or (old_info["num_registers"], old_info["format"]) != (
                 new_info["num_registers"],
                 new_info["format"],
             ):
-                dev["register_slots"].pop(old_reg, None)
-        for reg in new_dynamic:
-            dev["register_slots"].setdefault(reg, self._new_point_slot())
+                dev["register_slots"].pop(old_key, None)
+                if isinstance(old_key, tuple) and len(old_key) == 2 and old_key[0] == 3:
+                    old_reg = old_key[1]
+                    if old_reg not in dev["known_registers"]:
+                        dev["register_slots"].pop(old_reg, None)
+        for dyn_key in new_dynamic:
+            slot = dev["register_slots"].get(dyn_key)
+            if slot is None:
+                slot = self._new_point_slot()
+                dev["register_slots"][dyn_key] = slot
+            if isinstance(dyn_key, tuple) and len(dyn_key) == 2 and dyn_key[0] == 3:
+                dev["register_slots"].setdefault(dyn_key[1], slot)
 
+        dev["fc3_configured_regs"] = fc3_regs
         dev["dynamic_registers"] = new_dynamic
         dev["dynamic_conflicts"] = new_conflicts
 
-    def _canonical_point_ref(self, dev: dict, pt_info: dict) -> str:
-        base = f"3/{pt_info['register']}/{pt_info['num_registers']}"
+    def _canonical_point_ref(self, dev: dict, pt_info: dict):
+        if "register" not in pt_info or pt_info.get("register") is None:
+            return None
+        fc = int(pt_info.get("fc", 3))
+        base = f"{fc}/{pt_info['register']}/{pt_info['num_registers']}"
         if not dev.get("unit_in_context"):
             base = f"{dev.get('slave_id_int')}/{base}"
         if pt_info.get("modbus_type"):
@@ -1094,11 +1244,25 @@ class UDMIHandler:
         if not isinstance(payload, dict):
             return
         slave_key = str(payload.get("slave_id"))
+        raw_fc = payload.get("fc")
+        if isinstance(raw_fc, bool):
+            return
+        payload_fc = 3 if raw_fc is None else int(raw_fc)
         with self._lock:
             dev = self.devices.get(slave_key)
             if dev is None:
                 return
             now = time.monotonic() if now_mono is None else now_mono
+            all_fc_regs = {
+                (int(info.get("fc", 3)), reg_addr): info
+                for reg_addr, info in dev["known_registers"].items()
+            }
+            for dyn_key, dyn_info in dev["dynamic_registers"].items():
+                if isinstance(dyn_key, tuple) and len(dyn_key) == 2:
+                    all_fc_regs[dyn_key] = dyn_info
+                else:
+                    all_fc_regs[(int(dyn_info.get("fc", 3)), int(dyn_key))] = dyn_info
+
             error = payload.get("error")
             if error:
                 kind = payload.get("error_kind")
@@ -1116,17 +1280,30 @@ class UDMIHandler:
                 if kind == ERROR_EXCEPTION and code in PERSISTENT_EXCEPTION_CODES:
                     start = payload.get("start_register")
                     qty = payload.get("quantity")
-                    if isinstance(start, int) and isinstance(qty, int) and qty > 0:
+                    if (
+                        isinstance(start, int)
+                        and not isinstance(start, bool)
+                        and isinstance(qty, int)
+                        and not isinstance(qty, bool)
+                        and qty > 0
+                    ):
                         end = start + qty - 1
-                        all_regs = {**dev["known_registers"], **dev["dynamic_registers"]}
-                        for reg_addr, info in all_regs.items():
+                        for reg_key, info in all_fc_regs.items():
+                            info_fc, reg_addr = reg_key
+                            if info_fc != payload_fc:
+                                continue
                             first = info["register"]
                             last = first + info["num_registers"] - 1
                             # Only points this request would have decoded (fully contained), and
                             # not points another request has just read successfully.
                             if first < start or last > end:
                                 continue
-                            slot = dev["register_slots"].setdefault(reg_addr, self._new_point_slot())
+                            slot = dev["register_slots"].get(reg_key)
+                            if slot is None:
+                                slot = self._new_point_slot()
+                                dev["register_slots"][reg_key] = slot
+                                if payload_fc == 3:
+                                    dev["register_slots"][reg_addr] = slot
                             if slot["updated_mono"] is not None and now - slot["updated_mono"] < self.error_grace_sec:
                                 continue
                             slot["error"] = f"{error} for registers {start}-{end}"
@@ -1138,32 +1315,51 @@ class UDMIHandler:
             dev["last_error"] = None
             data = payload.get("data") or {}
             sys_map = (self._modbus_dbo_map.get(dev["device_type"]) or {}).get("system") or {}
-            all_regs = {**dev["known_registers"], **dev["dynamic_registers"]}
             identity_changed = False
             for reg, value in data.items():
                 reg_key = str(reg)
-                if reg_key in sys_map:
-                    identity_changed |= self._update_system_info_locked(dev, sys_map[reg_key], value)
-                elif reg_key.isdigit() and int(reg_key) in all_regs:
-                    self._apply_register_value_locked(dev, int(reg_key), value, now)
+                sys_spec = sys_map.get(reg_key)
+                if sys_spec is not None and payload_fc == int(sys_spec.get("fc", 3)):
+                    identity_changed |= self._update_system_info_locked(dev, sys_spec, value)
+                elif reg_key.isdigit():
+                    reg_int = int(reg_key)
+                    slot_key = (payload_fc, reg_int)
+                    if slot_key in all_fc_regs or slot_key in dev["register_slots"]:
+                        self._apply_register_value_locked(dev, slot_key, value, now)
             for reg in (payload.get("unavailable") or {}):
                 reg_key = str(reg)
-                if reg_key.isdigit() and int(reg_key) in all_regs:
-                    slot = dev["register_slots"].get(int(reg_key))
-                    if slot is not None:
-                        slot["unavailable"] = True
-                        slot["unavailable_mono"] = now
+                if reg_key.isdigit():
+                    reg_int = int(reg_key)
+                    slot_key = (payload_fc, reg_int)
+                    if slot_key in all_fc_regs:
+                        slot = dev["register_slots"].get(slot_key)
+                        if slot is None and payload_fc == 3:
+                            slot = dev["register_slots"].get(reg_int)
+                        if slot is not None:
+                            slot["unavailable"] = True
+                            slot["unavailable_mono"] = now
             if identity_changed:
                 dev["config_dirty"] = True  # publish identity changes promptly
                 self._refresh_dirty_flag_locked(dev)
             self._refresh_health_locked(dev, now)
 
-    def _apply_register_value_locked(self, dev: dict, reg_addr: int, value, now: float):
-        if reg_addr not in dev["register_slots"]:
+    def _apply_register_value_locked(self, dev: dict, reg_key, value, now: float):
+        if isinstance(reg_key, tuple) and len(reg_key) == 2:
+            fc, reg_addr = int(reg_key[0]), int(reg_key[1])
+            slot_key = (fc, reg_addr)
+        else:
+            fc, reg_addr = 3, int(reg_key)
+            slot_key = (3, reg_addr)
+        slot = dev["register_slots"].get(slot_key)
+        if slot is None and fc == 3:
+            slot = dev["register_slots"].get(reg_addr)
+        if slot is None:
             return
-        if not isinstance(value, (int, float)) or isinstance(value, bool):
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value):
             return
-        slot = dev["register_slots"][reg_addr]
+        dev["register_slots"][slot_key] = slot
+        if fc == 3:
+            dev["register_slots"][reg_addr] = slot
         slot["present_value"] = value
         slot["updated_mono"] = now
         slot["unavailable"] = False
@@ -1204,8 +1400,55 @@ class UDMIHandler:
 
     # ------------------------------------------------------------ health/state
 
-    def _point_health_locked(self, dev: dict, reg_addr: int, now: float):
-        slot = dev["register_slots"].get(reg_addr) or self._new_point_slot()
+    @staticmethod
+    def _collect_gateway_point_values(dev: dict) -> dict:
+        metrics = _collect_host_metrics()
+        metrics["restart_count"] = int(dev.get("restart_count", 1))
+        return metrics
+
+    @staticmethod
+    def _slot_has_activity(slot: dict) -> bool:
+        return (
+            slot is not None
+            and (
+                slot.get("updated_mono") is not None
+                or slot.get("error") is not None
+                or bool(slot.get("unavailable"))
+            )
+        )
+
+    def _get_point_slot_locked(self, dev: dict, pt_info: dict):
+        reg_addr = pt_info.get("register")
+        if reg_addr is None:
+            return None
+        fc = int(pt_info.get("fc", 3))
+        slot = dev["register_slots"].get((fc, reg_addr))
+        if fc == 3:
+            return slot if slot is not None else dev["register_slots"].get(reg_addr)
+        if self._slot_has_activity(slot):
+            return slot
+        if (
+            reg_addr in dev.get("legacy_known_regs", ())
+            and reg_addr not in dev.get("fc3_configured_regs", ())
+        ):
+            legacy_slot = dev["register_slots"].get(reg_addr)
+            if (
+                legacy_slot is not None
+                and legacy_slot.get("updated_mono") is not None
+                and not legacy_slot.get("unavailable")
+            ):
+                return legacy_slot
+        return slot
+
+    def _point_health_locked(self, dev: dict, pt_info_or_reg, now: float):
+        if isinstance(pt_info_or_reg, dict):
+            slot = self._get_point_slot_locked(dev, pt_info_or_reg) or self._new_point_slot()
+        else:
+            slot = (
+                dev["register_slots"].get((3, pt_info_or_reg))
+                or dev["register_slots"].get(pt_info_or_reg)
+                or self._new_point_slot()
+            )
         updated = slot["updated_mono"]
         if slot["unavailable"] and (updated is None or slot["unavailable_mono"] >= updated):
             return "failure", "Meter reports the value as not available"
@@ -1220,7 +1463,15 @@ class UDMIHandler:
             return "failure", f"No fresh Modbus reading within {stale_desc}"
         return "ok", None
 
-    def _evaluate_point_locked(self, dev: dict, point_name: str, pt_cfg, now: float, for_events: bool = False):
+    def _evaluate_point_locked(
+        self,
+        dev: dict,
+        point_name: str,
+        pt_cfg,
+        now: float,
+        for_events: bool = False,
+        host_values: dict = None,
+    ):
         """Return (value_state, status tuple) for a configured point.
 
         With `for_events=True` the writeback check is skipped: a rejected `set_value` does not make
@@ -1245,7 +1496,18 @@ class UDMIHandler:
                 LEVEL_ERROR,
                 f"Point {point_name} is read-only; set_value is not supported",
             )
-        health, message = self._point_health_locked(dev, pt_info["register"], now)
+        host_metric = pt_info.get("host_metric")
+        if host_metric is not None:
+            values = host_values if host_values is not None else self._collect_gateway_point_values(dev)
+            val = values.get(host_metric)
+            if isinstance(val, (int, float)) and not isinstance(val, bool) and math.isfinite(val):
+                return None, None
+            return "failure", (
+                CATEGORY_POINTSET_POINT_FAILURE,
+                LEVEL_ERROR,
+                f"Point {point_name}: host metric '{host_metric}' unavailable",
+            )
+        health, message = self._point_health_locked(dev, pt_info, now)
         if health == "failure":
             return "failure", (CATEGORY_POINTSET_POINT_FAILURE, LEVEL_ERROR, f"Point {point_name}: {message}")
         if health == "initializing":
@@ -1281,8 +1543,11 @@ class UDMIHandler:
                 dev["operational"] = sig is None
                 changed = True
 
+        host_values = (
+            self._collect_gateway_point_values(dev) if dev.get("gateway_points_enabled") else None
+        )
         new_sigs = {
-            name: self._evaluate_point_locked(dev, name, cfg, now)
+            name: self._evaluate_point_locked(dev, name, cfg, now, host_values=host_values)
             for name, cfg in dev["configured_points"].items()
         }
         if new_sigs != dev["point_sigs"]:
@@ -1884,7 +2149,9 @@ class UDMIHandler:
                 if use_details:
                     if pt_info.get("units"):
                         pt_entry["units"] = str(pt_info["units"])
-                    pt_entry["ref"] = self._canonical_point_ref(dev, pt_info)
+                    ref_str = self._canonical_point_ref(dev, pt_info)
+                    if ref_str is not None:
+                        pt_entry["ref"] = ref_str
                 points_out[pt_name] = pt_entry
             event["points"] = points_out
 
@@ -1901,21 +2168,21 @@ class UDMIHandler:
             return events
 
     @staticmethod
+    def _strip_entry_ts(obj):
+        if isinstance(obj, dict):
+            if "category" in obj and "level" in obj and "timestamp" in obj:
+                obj.pop("timestamp", None)
+            for val in obj.values():
+                UDMIHandler._strip_entry_ts(val)
+        elif isinstance(obj, list):
+            for item in obj:
+                UDMIHandler._strip_entry_ts(item)
+
+    @staticmethod
     def _canonicalize_state_for_diff(state_body: dict) -> str:
         """Canonicalize state while ignoring inner status entry timestamps."""
         normalized = copy.deepcopy(state_body)
-
-        def _strip_entry_ts(obj):
-            if isinstance(obj, dict):
-                if "category" in obj and "level" in obj and "timestamp" in obj:
-                    obj.pop("timestamp", None)
-                for val in obj.values():
-                    _strip_entry_ts(val)
-            elif isinstance(obj, list):
-                for item in obj:
-                    _strip_entry_ts(item)
-
-        _strip_entry_ts(normalized)
+        UDMIHandler._strip_entry_ts(normalized)
         return json.dumps(normalized, sort_keys=True)
 
     def _refresh_dirty_flag_locked(self, dev: dict, force_dirty: bool = False):
@@ -2066,19 +2333,28 @@ class UDMIHandler:
             if dev is None:
                 raise KeyError(f"Unknown device '{identifier}'")
             now = time.monotonic() if now_mono is None else now_mono
+            host_values = (
+                self._collect_gateway_point_values(dev)
+                if dev.get("gateway_points_enabled")
+                else None
+            )
             points_out = {}
             for pt_name, pt_cfg in dev["configured_points"].items():
                 value_state, _status = self._evaluate_point_locked(
-                    dev, pt_name, pt_cfg, now, for_events=True
+                    dev, pt_name, pt_cfg, now, for_events=True, host_values=host_values
                 )
                 if value_state is not None:
                     continue
                 _err_state, _err_status, pt_info = self._resolve_point_locked(dev, pt_name, pt_cfg)
                 if pt_info is None:
                     continue
-                slot = dev["register_slots"].get(pt_info["register"])
-                val = slot["present_value"] if slot else None
-                if isinstance(val, (int, float)) and not isinstance(val, bool):
+                host_metric = pt_info.get("host_metric")
+                if host_metric is not None:
+                    val = (host_values or {}).get(host_metric)
+                else:
+                    slot = self._get_point_slot_locked(dev, pt_info)
+                    val = slot["present_value"] if slot else None
+                if isinstance(val, (int, float)) and not isinstance(val, bool) and math.isfinite(val):
                     points_out[pt_name] = {"present_value": val}
 
             data = {
@@ -2101,7 +2377,11 @@ class UDMIHandler:
                 return None
             if not dev["configured_points"]:
                 return None
-            if not dev["known_registers"] and not dev["dynamic_registers"]:
+            if (
+                not dev["known_registers"]
+                and not dev["dynamic_registers"]
+                and not dev.get("gateway_points_enabled")
+            ):
                 return None
             now = time.monotonic() if now_mono is None else now_mono
 

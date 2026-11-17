@@ -506,3 +506,377 @@ def test_offline_pointset_telemetry_is_buffered_and_flushed_on_reconnect(tmp_pat
         publisher.close()
         observer.close()
 
+
+def _e2e_register_lookup(slave_id, extra_fc_regs=None):
+    reg_words = {}
+    for req, resp in sim.build_slave_frames(slave_id, 1):
+        req_fc = req[1]
+        start_reg = int.from_bytes(req[2:4], "big") + 1
+        qty = int.from_bytes(req[4:6], "big")
+        data_bytes = resp[3:-2]
+        for idx in range(qty):
+            reg_words[(req_fc, start_reg + idx)] = data_bytes[idx * 2 : idx * 2 + 2]
+    if extra_fc_regs:
+        for (req_fc, reg_addr), raw_bytes in extra_fc_regs.items():
+            for idx in range(0, len(raw_bytes), 2):
+                reg_words[(req_fc, reg_addr + (idx // 2))] = raw_bytes[idx : idx + 2]
+    return reg_words
+
+
+def _e2e_answer_pdu(reg_words, unit_id, pdu_bytes):
+    req_fc = pdu_bytes[0]
+    start_reg = int.from_bytes(pdu_bytes[1:3], "big") + 1
+    qty = int.from_bytes(pdu_bytes[3:5], "big")
+    if req_fc not in (3, 4):
+        return bytes([unit_id, req_fc | 0x80, 0x01])
+    payload = bytearray([unit_id, req_fc, qty * 2])
+    for offset in range(qty):
+        payload.extend(reg_words.get((req_fc, start_reg + offset), b"\x00\x00"))
+    return bytes(payload)
+
+
+class _E2EModbusTCPServer:
+    def __init__(self, registers_by_slave):
+        import struct
+
+        self._struct = struct
+        self._registers_by_slave = registers_by_slave
+        self._stop = threading.Event()
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.bind(("127.0.0.1", 0))
+        self._sock.listen(4)
+        self._sock.settimeout(0.1)
+        self.port = self._sock.getsockname()[1]
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self._thread.start()
+
+    def _serve(self):
+        while not self._stop.is_set():
+            try:
+                conn, _addr = self._sock.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            conn.settimeout(0.2)
+            try:
+                while not self._stop.is_set():
+                    try:
+                        mbap = conn.recv(7)
+                    except socket.timeout:
+                        continue
+                    if not mbap or len(mbap) < 7:
+                        break
+                    tx_id, proto_id, length, unit_id = self._struct.unpack(">HHHB", mbap)
+                    pdu = conn.recv(length - 1)
+                    if len(pdu) < 5:
+                        break
+                    reg_words = self._registers_by_slave.get(unit_id, {})
+                    body = _e2e_answer_pdu(reg_words, unit_id, pdu)
+                    conn.sendall(self._struct.pack(">HHH", tx_id, proto_id, len(body)) + body)
+            except OSError:
+                pass
+            finally:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+
+    def close(self):
+        self._stop.set()
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+        self._thread.join(timeout=5)
+
+
+class _E2EPtyRtuSlave:
+    def __init__(self, master_fd, registers_by_slave):
+        import select
+        from google_iot_core_gateway.modbus_gw.modbus_to_json import append_modbus_crc16
+
+        self._master_fd = master_fd
+        self._registers_by_slave = registers_by_slave
+        self._select = select
+        self._append_crc = append_modbus_crc16
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self._thread.start()
+
+    def _serve(self):
+        from google_iot_core_gateway.modbus_gw.modbus_to_json import verify_modbus_crc16
+
+        buf = bytearray()
+        while not self._stop.is_set():
+            try:
+                readable, _wr, _ex = self._select.select([self._master_fd], [], [], 0.05)
+            except (OSError, ValueError):
+                break
+            if not readable:
+                continue
+            try:
+                chunk = os.read(self._master_fd, 256)
+            except OSError:
+                break
+            if not chunk:
+                break
+            buf.extend(chunk)
+            while len(buf) >= 8:
+                frame = bytes(buf[:8])
+                del buf[:8]
+                if not verify_modbus_crc16(frame):
+                    continue
+                unit_id = frame[0]
+                reg_words = self._registers_by_slave.get(unit_id, {})
+                body = _e2e_answer_pdu(reg_words, unit_id, frame[1:6])
+                os.write(self._master_fd, self._append_crc(body))
+
+    def close(self):
+        self._stop.set()
+        self._thread.join(timeout=5)
+
+
+def test_broker_free_modbus_tcp_end_to_end(tmp_path, broker, logger):
+    import struct
+    from google_iot_core_gateway.gcp_handler import start_google_iot_core_gateway
+
+    port = broker["port"]
+    site_dir = write_site_model(tmp_path)
+    state_dir = tmp_path / "state-tcp"
+    reg_words = _e2e_register_lookup(1, extra_fc_regs={(4, 4000): struct.pack(">f", 241.5)})
+    tcp_server = _E2EModbusTCPServer({1: reg_words})
+    cfg_path = tmp_path / "gateway-tcp.json"
+    cfg_path.write_text(
+        json.dumps(
+            {
+                "internal_broker": {"enabled": False, "mqtt_bridge_port": 1},
+                "google_cloud": {
+                    "iot_provider": "mqtt",
+                    "mqtt_bridge_hostname": "127.0.0.1",
+                    "mqtt_bridge_port": port,
+                    "enable_tls": False,
+                    "sample_rate_set": 1,
+                },
+                "modbus": {
+                    "poll_mode": "active",
+                    "transport": "tcp",
+                    "poll_host": "127.0.0.1",
+                    "poll_port": tcp_server.port,
+                    "poll_interval_sec": 0.5,
+                    "poll_timeout_sec": 1.0,
+                },
+                "site_details": {
+                    "gateway_id": "CGW-1",
+                    "serial_no": "GW-TCP-E2E",
+                    "proxy_ids": {"EM-1": {"type": "PM5561", "modbus_slave_id": 1, "port": "ttyM0"}},
+                },
+                "environment_setup": {
+                    "udmi_site_model_path": str(site_dir),
+                    "resources_path": RESOURCES_DIR,
+                    "state_dir": str(state_dir),
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    observer = Observer(port)
+    stop_event = threading.Event()
+    result = {}
+    gw_thread = threading.Thread(
+        target=lambda: result.setdefault(
+            "rc",
+            start_google_iot_core_gateway(
+                logger,
+                types.SimpleNamespace(config_file=str(cfg_path)),
+                root_dir=REPO_ROOT,
+                stop_event=stop_event,
+            ),
+        ),
+        daemon=True,
+    )
+    gw_thread.start()
+    try:
+        observer.wait_for(lambda topic, _payload: topic == f"{PREFIX}/EM-1/attach", timeout=15)
+        observer.send_config("CGW-1", _base_config("2026-11-17T10:00:00Z", gateway={"proxy_ids": ["EM-1"]}))
+        observer.send_config(
+            "EM-1",
+            _base_config(
+                "2026-11-17T10:00:00Z",
+                gateway={"target": {"family": "modbus"}},
+                pointset={
+                    "sample_rate_sec": 1,
+                    "points": {
+                        "line1_neutral_voltage_sensor": {"ref": "3/3028/2?type=FLOAT32"},
+                        "input_voltage": {"ref": "4/4000/2?type=FLOAT32"},
+                    },
+                },
+            ),
+        )
+        _topic, ev_payload = observer.wait_for(
+            lambda topic, payload: (
+                topic == f"{PREFIX}/EM-1/events/pointset"
+                and "line1_neutral_voltage_sensor" in json.loads(payload).get("points", {})
+                and "input_voltage" in json.loads(payload).get("points", {})
+            ),
+            timeout=15,
+        )
+        pts = json.loads(ev_payload)["points"]
+        assert pts["line1_neutral_voltage_sensor"]["present_value"] > 200
+        assert pts["input_voltage"]["present_value"] == pytest.approx(241.5, rel=1e-4)
+
+        observer.wait_for(
+            _state_of("EM-1", lambda state: state.get("system", {}).get("serial_no") == "52110001"),
+            timeout=15,
+        )
+        _gw_topic, gw_state = observer.wait_for(
+            _state_of("CGW-1", lambda state: state["system"]["last_config"] == "2026-11-17T10:00:00Z"),
+            timeout=15,
+        )
+        assert "pointset" not in json.loads(gw_state)
+    finally:
+        stop_event.set()
+        gw_thread.join(timeout=10)
+        tcp_server.close()
+        observer.close()
+    assert result.get("rc") == EXIT_OK
+
+
+def test_broker_free_rtu_pty_and_gateway_points_end_to_end(tmp_path, broker, logger):
+    import pty
+    import struct
+    from google_iot_core_gateway.gcp_handler import start_google_iot_core_gateway
+
+    port = broker["port"]
+    site_dir = write_site_model(tmp_path)
+    state_dir = tmp_path / "state-rtu"
+    master_fd, slave_fd = pty.openpty()
+    slave_path = os.ttyname(slave_fd)
+    reg_words = _e2e_register_lookup(1, extra_fc_regs={(4, 4010): struct.pack(">f", 15.75)})
+    rtu_slave = _E2EPtyRtuSlave(master_fd, {1: reg_words})
+
+    cfg_path = tmp_path / "gateway-rtu.json"
+    cfg_path.write_text(
+        json.dumps(
+            {
+                "internal_broker": {"enabled": False},
+                "google_cloud": {
+                    "iot_provider": "mqtt",
+                    "mqtt_bridge_hostname": "127.0.0.1",
+                    "mqtt_bridge_port": port,
+                    "enable_tls": False,
+                    "sample_rate_set": 1,
+                },
+                "modbus": {
+                    "poll_mode": "active",
+                    "transport": "rtu",
+                    "serial_ports": {"ttyM0": slave_path},
+                    "baudrate": 19200,
+                    "parity": "E",
+                    "stopbits": 1,
+                    "rs485_mode": True,
+                    "poll_interval_sec": 0.5,
+                    "poll_timeout_sec": 1.0,
+                },
+                "site_details": {
+                    "gateway_id": "CGW-1",
+                    "serial_no": "GW-RTU-E2E",
+                    "gateway_points_enabled": True,
+                    "proxy_ids": {"EM-1": {"type": "PM5561", "modbus_slave_id": 1, "port": "ttyM0"}},
+                },
+                "environment_setup": {
+                    "udmi_site_model_path": str(site_dir),
+                    "resources_path": RESOURCES_DIR,
+                    "state_dir": str(state_dir),
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    observer = Observer(port)
+    stop_event = threading.Event()
+    result = {}
+    gw_thread = threading.Thread(
+        target=lambda: result.setdefault(
+            "rc",
+            start_google_iot_core_gateway(
+                logger,
+                types.SimpleNamespace(config_file=str(cfg_path)),
+                root_dir=REPO_ROOT,
+                stop_event=stop_event,
+            ),
+        ),
+        daemon=True,
+    )
+    gw_thread.start()
+    try:
+        observer.wait_for(lambda topic, _payload: topic == f"{PREFIX}/EM-1/attach", timeout=15)
+        observer.send_config(
+            "CGW-1",
+            _base_config(
+                "2026-11-17T10:05:00Z",
+                gateway={"proxy_ids": ["EM-1"]},
+                pointset={"sample_rate_sec": 1},
+            ),
+        )
+        observer.send_config(
+            "EM-1",
+            _base_config(
+                "2026-11-17T10:05:00Z",
+                gateway={"target": {"family": "modbus"}},
+                pointset={
+                    "sample_rate_sec": 1,
+                    "points": {
+                        "line1_neutral_voltage_sensor": {"ref": "3/3028/2?type=FLOAT32"},
+                        "input_current": {"ref": "4/4010/2?type=FLOAT32"},
+                    },
+                },
+            ),
+        )
+        _em_topic, em_ev_payload = observer.wait_for(
+            lambda topic, payload: (
+                topic == f"{PREFIX}/EM-1/events/pointset"
+                and "line1_neutral_voltage_sensor" in json.loads(payload).get("points", {})
+                and "input_current" in json.loads(payload).get("points", {})
+            ),
+            timeout=15,
+        )
+        em_pts = json.loads(em_ev_payload)["points"]
+        assert em_pts["line1_neutral_voltage_sensor"]["present_value"] > 200
+        assert em_pts["input_current"]["present_value"] == pytest.approx(15.75, rel=1e-4)
+
+        observer.wait_for(
+            _state_of("EM-1", lambda state: state.get("system", {}).get("serial_no") == "52110001"),
+            timeout=15,
+        )
+        _gw_state_topic, gw_state_payload = observer.wait_for(
+            _state_of(
+                "CGW-1",
+                lambda state: "restart_count" in state.get("pointset", {}).get("points", {}),
+            ),
+            timeout=15,
+        )
+        assert gw_state_payload
+        _gw_ev_topic, gw_ev_payload = observer.wait_for(
+            lambda topic, payload: (
+                topic == f"{PREFIX}/CGW-1/events/pointset"
+                and "restart_count" in json.loads(payload).get("points", {})
+            ),
+            timeout=15,
+        )
+        gw_pts = json.loads(gw_ev_payload)["points"]
+        assert gw_pts["restart_count"]["present_value"] == 1
+        assert gw_pts["store_total_mb"]["present_value"] > 0
+    finally:
+        stop_event.set()
+        gw_thread.join(timeout=10)
+        rtu_slave.close()
+        os.close(slave_fd)
+        os.close(master_fd)
+        observer.close()
+    assert result.get("rc") == EXIT_OK
+
+

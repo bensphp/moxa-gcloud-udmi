@@ -20,13 +20,34 @@ POLL_MODES = ("off", "fallback", "active")
 LOG_THROTTLE_SEC = 300.0
 
 
+def build_modbus_tcp_read_request(
+    tx_id: int, unit_id: int, fc: int, start_register_1based: int, quantity: int
+) -> bytes:
+    """Build a Modbus TCP MBAP + FC03/FC04 Read Registers ADU."""
+    if isinstance(fc, bool) or not isinstance(fc, int) or fc not in (3, 4):
+        raise ValueError(f"Unsupported Modbus function code {fc}; expected 3 or 4")
+    if isinstance(start_register_1based, bool) or not isinstance(start_register_1based, int):
+        raise ValueError("start_register_1based must be an integer")
+    if isinstance(quantity, bool) or not isinstance(quantity, int):
+        raise ValueError("quantity must be an integer")
+    if isinstance(unit_id, bool) or not isinstance(unit_id, int):
+        raise ValueError("unit_id must be an integer")
+    if not (1 <= start_register_1based <= 65536):
+        raise ValueError(f"start_register_1based {start_register_1based} out of range 1..65536")
+    if not (1 <= quantity <= 125):
+        raise ValueError(f"quantity {quantity} out of range 1..125")
+    if not (0 <= unit_id <= 255):
+        raise ValueError(f"unit_id {unit_id} out of range 0..255")
+    pdu = struct.pack(">BHH", fc, start_register_1based - 1, quantity)
+    mbap = struct.pack(">HHHB", tx_id & 0xFFFF, 0, len(pdu) + 1, unit_id & 0xFF)
+    return mbap + pdu
+
+
 def build_modbus_tcp_fc3_request(
     tx_id: int, unit_id: int, start_register_1based: int, quantity: int
 ) -> bytes:
     """Build a Modbus TCP MBAP + FC03 Read Holding Registers ADU."""
-    pdu = struct.pack(">BHH", 3, int(start_register_1based) - 1, int(quantity))
-    mbap = struct.pack(">HHHB", tx_id & 0xFFFF, 0, len(pdu) + 1, int(unit_id) & 0xFF)
-    return mbap + pdu
+    return build_modbus_tcp_read_request(tx_id, unit_id, 3, start_register_1based, quantity)
 
 
 def _recv_exact(sock: socket.socket, nbytes: int) -> bytes:
@@ -135,23 +156,45 @@ class ModbusTCPPoller:
         return self._sock
 
     def poll_once(self) -> int:
-        """Execute one polling pass across targets returned by `udmi_handler.get_poll_targets()`."""
-        targets = self.udmi_handler.get_poll_targets(
-            self.mode, poll_interval_sec=self.interval_sec
-        )
-        if not targets:
+        """Execute one polling pass across targets returned by `udmi_handler.get_poll_plan()`."""
+        plan_items = []
+        get_plan = None
+        try:
+            get_plan = self.udmi_handler.get_poll_plan
+        except AttributeError:
+            get_plan = None
+
+        if callable(get_plan):
+            plan = get_plan(self.mode, poll_interval_sec=self.interval_sec)
+            for target in plan or ():
+                slave_id = target["slave_id"]
+                blocks = target.get("blocks") or ()
+                if blocks:
+                    plan_items.append((slave_id, blocks))
+        else:
+            targets = self.udmi_handler.get_poll_targets(
+                self.mode, poll_interval_sec=self.interval_sec
+            )
+            for slave_id, blocks in targets or ():
+                fc3_blocks = [(3, start_reg, qty) for start_reg, qty in blocks]
+                if fc3_blocks:
+                    plan_items.append((slave_id, fc3_blocks))
+
+        if not plan_items:
             return 0
         polled = 0
         with self._sock_lock:
-            for slave_id, blocks in targets:
+            for slave_id, blocks in plan_items:
                 if self._stop_event.is_set():
                     break
-                for start_reg, qty in blocks:
+                for fc, start_reg, qty in blocks:
                     if self._stop_event.is_set():
                         break
                     self._tx_id = (self._tx_id + 1) & 0xFFFF or 1
-                    adu = build_modbus_tcp_fc3_request(self._tx_id, slave_id, start_reg, qty)
                     try:
+                        adu = build_modbus_tcp_read_request(
+                            self._tx_id, slave_id, fc, start_reg, qty
+                        )
                         sock = self._ensure_socket_locked()
                         sock.sendall(adu)
                         resp_body = read_modbus_tcp_response(sock, self._tx_id, slave_id)
@@ -159,7 +202,7 @@ class ModbusTCPPoller:
                         self._close_socket_locked()
                         self._log_error_throttled(
                             f"Modbus TCP poll failed ({self.host}:{self.port}, "
-                            f"unit {slave_id} {start_reg}+{qty}): {exc}"
+                            f"unit {slave_id} fc {fc} {start_reg}+{qty}): {exc}"
                         )
                         continue
                     rtu_req = append_modbus_crc16(adu[6:])

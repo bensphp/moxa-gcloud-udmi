@@ -18,7 +18,7 @@ from pathlib import Path
 
 __author__ = "Moxa Europe"
 __license__ = "GPLv3.0"
-__version__ = '4.4.0'
+__version__ = "4.5.0"
 __status__ = "Production"
 
 UDMI_VERSION = "1.5.2"
@@ -27,7 +27,7 @@ UDMI_VERSION = "1.5.2"
 #
 # See: https://pyinstaller.readthedocs.io/en/stable/runtime-information.html#
 #
-if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+if bool(vars(sys).get("frozen", False)) and "_MEIPASS" in vars(sys):
     # running in a PyInstaller bundle
     RUNNING_BUNDLE = True
 else:
@@ -47,7 +47,7 @@ else:
 if RUNNING_BUNDLE:
     # running in a PyInstaller bundle
     # noinspection PyProtectedMember,PyUnresolvedReferences
-    BUNDLE_DIR = Path(sys._MEIPASS)
+    BUNDLE_DIR = Path(vars(sys)["_MEIPASS"])
     APP_DIR = Path(sys.executable).parent
     ROOT_DIR = APP_DIR
 else:

@@ -227,17 +227,71 @@ def decode_register_bytes(byte_value: bytes, data_format: str):
     return DECODE_OK, value
 
 
-def _compiled_registers(meter_map_raw) -> list:
-    """Return [(reg_addr_int, total_bytes, data_format), ...] from a meter register map."""
+def _compiled_registers(meter_map_raw, function_code: Optional[int] = None) -> list:
+    """Return [(reg_addr_int, total_bytes, data_format), ...] from a meter register map.
+
+    Entries keyed ``"<fc>:<reg>"`` match only that function code and take precedence over legacy
+    integer keys for that function code. Entries with an explicit ``"fc"`` field match only that
+    function code; legacy integer keys without ``"fc"`` match both FC03 and FC04.
+    """
     flat_registers = flatten_meter_registers(meter_map_raw)
-    compiled = []
-    for reg_str in flat_registers:
+    fc_specific = {}
+    legacy_entries = []
+
+    for reg_str, spec in flat_registers.items():
+        if not isinstance(spec, dict):
+            continue
+        key_str = str(reg_str)
+        if ":" in key_str:
+            fc_part, _sep, reg_part = key_str.partition(":")
+            try:
+                entry_fc = int(fc_part)
+                reg_addr = int(reg_part)
+            except ValueError:
+                continue
+            if function_code is not None and entry_fc != function_code:
+                continue
+            _total_registers, total_bytes, data_format = _get_dbo_properties(
+                flat_registers, key_str
+            )
+            fc_specific[(entry_fc, reg_addr)] = (reg_addr, total_bytes, data_format)
+            continue
+
         try:
-            reg_addr = int(reg_str)
+            reg_addr = int(key_str)
         except ValueError:
             continue
-        _total_registers, total_bytes, data_format = _get_dbo_properties(flat_registers, reg_addr)
-        compiled.append((reg_addr, total_bytes, data_format))
+        spec_fc = spec.get("fc")
+        if spec_fc is not None:
+            if isinstance(spec_fc, bool):
+                continue
+            if not isinstance(spec_fc, int):
+                try:
+                    spec_fc = int(spec_fc)
+                except (TypeError, ValueError):
+                    continue
+            allowed_fcs = (spec_fc,)
+        else:
+            allowed_fcs = (3, 4)
+
+        if function_code is not None and function_code not in allowed_fcs:
+            continue
+        _total_registers, total_bytes, data_format = _get_dbo_properties(flat_registers, key_str)
+        legacy_entries.append((reg_addr, total_bytes, data_format))
+
+    if function_code is not None:
+        specific_regs = {reg_addr for (_fc, reg_addr) in fc_specific}
+        compiled = list(fc_specific.values())
+        for reg_addr, total_bytes, data_format in legacy_entries:
+            if reg_addr not in specific_regs:
+                compiled.append((reg_addr, total_bytes, data_format))
+        return compiled
+
+    compiled = list(legacy_entries)
+    legacy_regs = {reg_addr for reg_addr, _bytes, _fmt in legacy_entries}
+    for (_fc, reg_addr), entry in fc_specific.items():
+        if reg_addr not in legacy_regs:
+            compiled.append(entry)
     return compiled
 
 
@@ -356,7 +410,7 @@ def _build_fc3_fc4_dict(
         logger.error(f"Meter map '{meter_type}' could not be loaded")
         return None
 
-    compiled_registers = _compiled_registers(meter_map_raw)
+    compiled_registers = _compiled_registers(meter_map_raw, function_code=function_code)
     rtu_response_bytes = rtu_response[3:-2]
 
     data_dict = {}

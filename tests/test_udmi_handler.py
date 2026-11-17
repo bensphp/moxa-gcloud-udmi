@@ -19,15 +19,20 @@ from google_iot_core_gateway.udmi_handler.udmi_handler import (
     CATEGORY_SYSTEM_CONFIG_PARSE,
     CATEGORY_SYSTEM_CONFIG_RECEIVE,
     GATEWAY_FEATURES,
+    GATEWAY_HOST_POINTS,
     LEVEL_DEBUG,
     LEVEL_ERROR,
     LEVEL_WARNING,
     PROXY_FEATURES,
+    group_fc_register_spans,
     parse_modbus_ref,
 )
 from conftest import META_METER_IDENTITY, RESOURCES_DIR, write_site_model
 from google_iot_core_gateway.gcp_handler import process_payloads
-from google_iot_core_gateway.modbus_gw.modbus_to_json import append_modbus_crc16
+from google_iot_core_gateway.modbus_gw.modbus_to_json import (
+    append_modbus_crc16,
+    decode_modbus_frame,
+)
 from helpers import config as _config, meter_config as _meter_config, exception_reply as _exception
 from helpers import V, frame as _frame, state_of as _state
 
@@ -556,3 +561,225 @@ def test_clock_step_back_resynchronizes_timestamps(handler_factory, monkeypatch,
         t3 = h.get_timestamp()
     assert t3 < t1
     assert "stepped backwards" in caplog.text
+
+
+class TestFC04AndDecoderMaps:
+    def test_group_fc_register_spans_groups_per_fc(self):
+        grouped = group_fc_register_spans([(4, 200, 2), (3, 100, 1), (4, 202, 2), (3, 101, 2)])
+        assert grouped == [(3, 100, 3), (4, 200, 4)]
+
+    def test_canonical_point_ref_uses_fc4_and_omits_host_metrics(self, handler_factory):
+        handler = handler_factory()
+        dev = handler.devices_by_id["EM-1"]
+        assert (
+            handler._canonical_point_ref(
+                dev, {"register": 3028, "num_registers": 2, "modbus_type": "FLOAT32", "fc": 4}
+            )
+            == "4/3028/2?type=FLOAT32"
+        )
+        assert (
+            handler._canonical_point_ref(dev, {"host_metric": "mem_free_mb", "units": "Megabytes"})
+            is None
+        )
+
+    def test_decoder_fc_key_precedence_and_isolation(self, handler_factory):
+        import struct
+
+        handler = handler_factory()
+        handler.handle_config(
+            "EM-1",
+            _meter_config(
+                points={
+                    "holding_v": {"ref": "3/3028/2?type=FLOAT32"},
+                    "input_v": {"ref": "4/3028/2?type=FLOAT32"},
+                    "holding_extra": {"ref": "3/4500/1?type=INT16"},
+                    "input_extra": {"ref": "4/4500/2?type=FLOAT32"},
+                }
+            ),
+        )
+        slave_to_type, dbo_maps = handler.get_decoder_maps()
+        dev_map = dbo_maps[slave_to_type[1]]
+        assert "3:4500" in dev_map and "4:4500" in dev_map
+
+        req_fc3 = append_modbus_crc16(struct.pack(">BBHH", 1, 3, 4499, 1))
+        resp_fc3 = append_modbus_crc16(struct.pack(">BBB", 1, 3, 2) + struct.pack(">h", 77))
+        decoded_fc3 = decode_modbus_frame(
+            req_fc3, resp_fc3, slave_to_type=slave_to_type, dbo_maps=dbo_maps
+        )
+        assert decoded_fc3["fc"] == 3
+        assert decoded_fc3["data"] == {"4500": 77}
+
+        req_fc4 = append_modbus_crc16(struct.pack(">BBHH", 1, 4, 4499, 2))
+        resp_fc4 = append_modbus_crc16(struct.pack(">BBB", 1, 4, 4) + struct.pack(">f", 12.5))
+        decoded_fc4 = decode_modbus_frame(
+            req_fc4, resp_fc4, slave_to_type=slave_to_type, dbo_maps=dbo_maps
+        )
+        assert decoded_fc4["fc"] == 4
+        assert decoded_fc4["data"] == {"4500": 12.5}
+
+        handler.record_modbus_payload(decoded_fc3)
+        handler.record_modbus_payload(decoded_fc4)
+        points = json.loads(handler.get_event_point_payload("EM-1"))["points"]
+        assert points == {
+            "holding_extra": {"present_value": 77},
+            "input_extra": {"present_value": 12.5},
+        }
+
+    def test_fc04_same_address_different_type_and_fc03_exception_do_not_collide(self, handler_factory):
+        import struct
+
+        handler = handler_factory()
+        handler.error_grace_sec = 0.0
+        # 3028 is FLOAT32 (2 regs) in PM5561 FC03 map; FC04 at 3028 can be a distinct INT16 point.
+        handler.handle_config(
+            "EM-1",
+            _meter_config(points={"input_word_3028": {"ref": "4/3028/1?type=INT16", "units": "Amperes"}}),
+        )
+        # An FC03 exception at 3028 must not fail the FC04 point even when FC03 is unconfigured.
+        handler.record_modbus_payload(_exception(0x02, 3028, 2))
+        assert _state(handler)["pointset"]["points"]["input_word_3028"] == {"value_state": "initializing"}
+
+        slave_to_type, dbo_maps = handler.get_decoder_maps()
+        req_fc4 = append_modbus_crc16(struct.pack(">BBHH", 1, 4, 3027, 1))
+        resp_fc4 = append_modbus_crc16(struct.pack(">BBB", 1, 4, 2) + struct.pack(">h", -42))
+        decoded_fc4 = decode_modbus_frame(
+            req_fc4, resp_fc4, slave_to_type=slave_to_type, dbo_maps=dbo_maps
+        )
+        assert decoded_fc4["data"] == {"3028": -42}
+        handler.record_modbus_payload(decoded_fc4)
+        assert _state(handler)["pointset"]["points"]["input_word_3028"] == {}
+        assert json.loads(handler.get_event_point_payload("EM-1"))["points"] == {
+            "input_word_3028": {"present_value": -42}
+        }
+
+
+class TestGatewayHostPointset:
+    def test_gateway_points_default_off_matches_v4_4_0(self, handler_factory):
+        handler = handler_factory()
+        state = _state(handler, "CGW-1")
+        assert "pointset" not in state
+        assert "pointset" not in handler.devices_by_id["CGW-1"]["supported_features"]
+        assert handler.pop_due_pointset_event_payload("CGW-1", now_mono=time.monotonic() + 60) is None
+
+    def test_gateway_points_opt_in_publishes_live_metrics_and_handles_configs(
+        self, site_dir, logger, monkeypatch
+    ):
+        monkeypatch.setattr(module, "detect_hardware_serial", lambda: None)
+        monkeypatch.setattr(
+            module,
+            "_collect_host_metrics",
+            lambda: {
+                "mem_free_mb": 512.5,
+                "mem_total_mb": 1024.0,
+                "store_free_mb": 2048.25,
+                "store_total_mb": 4096.0,
+                "system_load": 0.42,
+            },
+        )
+        handler = module.UDMIHandler(logger, RESOURCES_DIR, str(site_dir), config_wait_timeout_sec=0)
+        assert handler.register_gateway(
+            "CGW-1",
+            proxy_ids=[],
+            serial_no="GW-HOST",
+            restart_count=7,
+            gateway_points_enabled=True,
+        )
+
+        gw_dev = handler.devices_by_id["CGW-1"]
+        assert gw_dev["supported_features"]["pointset"] == {"stage": "stable"}
+        assert gw_dev["supported_features"]["enumeration.pointset"] == {"stage": "preview"}
+
+        # Before first cloud config, all 6 host points are active and publish numeric values.
+        state = _state(handler, "CGW-1")
+        assert set(state["pointset"]["points"]) == set(GATEWAY_HOST_POINTS)
+        for pt_state in state["pointset"]["points"].values():
+            assert pt_state == {}
+
+        ev = json.loads(handler.get_event_point_payload("CGW-1"))
+        assert ev["points"] == {
+            "mem_free_mb": {"present_value": 512.5},
+            "mem_total_mb": {"present_value": 1024.0},
+            "store_free_mb": {"present_value": 2048.25},
+            "store_total_mb": {"present_value": 4096.0},
+            "system_load": {"present_value": 0.42},
+            "restart_count": {"present_value": 7},
+        }
+        for entry in ev["points"].values():
+            val = entry["present_value"]
+            assert isinstance(val, (int, float)) and not isinstance(val, bool)
+
+        # Sample rate & sample limit honored; pointset_remove_point, extraneous, set_value, bad ref.
+        cfg = _config(
+            "2026-11-16T12:00:00Z",
+            pointset={
+                "sample_rate_sec": 5,
+                "sample_limit_sec": 5,
+                "points": {
+                    "mem_free_mb": {},
+                    "restart_count": {"set_value": 1},
+                    "system_load": {"ref": "bad-ref"},
+                    "bogus_metric": {},
+                },
+            },
+            discovery={
+                "generation": "2026-11-16T12:00:00Z",
+                "enumerations": {"features": "details", "points": "details"},
+            },
+        )
+        assert handler.handle_config("CGW-1", cfg)
+        now = time.monotonic()
+        assert handler.pop_due_pointset_event_payload("CGW-1", now_mono=now) is None
+        due_payload = handler.pop_due_pointset_event_payload("CGW-1", now_mono=now + 6.0)
+        assert due_payload is not None
+        due_points = json.loads(due_payload)["points"]
+        # restart_count has set_value (invalid in state) but still publishes present_value;
+        # mem_total_mb / store_* were removed; bogus_metric & system_load omitted.
+        assert due_points == {
+            "mem_free_mb": {"present_value": 512.5},
+            "restart_count": {"present_value": 7},
+        }
+
+        gw_state_points = _state(handler, "CGW-1")["pointset"]["points"]
+        assert set(gw_state_points) == {"mem_free_mb", "restart_count", "system_load", "bogus_metric"}
+        assert gw_state_points["mem_free_mb"] == {}
+        assert gw_state_points["restart_count"]["value_state"] == "invalid"
+        assert gw_state_points["system_load"]["value_state"] == "failure"
+        assert gw_state_points["bogus_metric"]["value_state"] == "invalid"
+
+        # Self-enumeration lists host points with units and cleanly omits "ref".
+        disc_events = [json.loads(item) for item in handler.pop_due_discovery_events("CGW-1")]
+        assert len(disc_events) == 1
+        disc = disc_events[0]
+        assert "pointset" in disc["features"]
+        assert "enumeration.pointset" in disc["features"]
+        assert set(disc["points"]) == set(GATEWAY_HOST_POINTS)
+        for pt_name, pt_units in GATEWAY_HOST_POINTS.items():
+            assert disc["points"][pt_name] == {"units": pt_units}
+            assert "ref" not in disc["points"][pt_name]
+
+    def test_gateway_points_auto_enabled_from_metadata_pointset(self, tmp_path, logger, monkeypatch):
+        monkeypatch.setattr(module, "detect_hardware_serial", lambda: None)
+        monkeypatch.setattr(
+            module,
+            "_collect_host_metrics",
+            lambda: {
+                "mem_free_mb": 256.0,
+                "mem_total_mb": 1024.0,
+                "store_free_mb": 1000.0,
+                "store_total_mb": 2000.0,
+                "system_load": 0.1,
+            },
+        )
+        site = write_site_model(tmp_path)
+        gw_meta_path = site / "devices" / "CGW-1" / "metadata.json"
+        gw_meta = json.loads(gw_meta_path.read_text(encoding="utf-8"))
+        gw_meta["pointset"] = {"points": {"mem_free_mb": {}, "restart_count": {}}}
+        gw_meta_path.write_text(json.dumps(gw_meta), encoding="utf-8")
+
+        handler = module.UDMIHandler(logger, RESOURCES_DIR, str(site), config_wait_timeout_sec=0)
+        assert handler.register_gateway("CGW-1", proxy_ids=[], serial_no="GW-META", restart_count=3)
+        assert _state(handler, "CGW-1")["pointset"]["points"] == {"mem_free_mb": {}, "restart_count": {}}
+        assert json.loads(handler.get_event_point_payload("CGW-1"))["points"] == {
+            "mem_free_mb": {"present_value": 256.0},
+            "restart_count": {"present_value": 3},
+        }
